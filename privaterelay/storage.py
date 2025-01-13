@@ -37,7 +37,8 @@ class RelayStaticFilesStorage(CompressedManifestStaticFilesStorage):
             return name
         else:
             new_name = super().hashed_name(name, content, filename)
-            assert isinstance(new_name, str)
+            if not isinstance(new_name, str):
+                raise TypeError("new_name must be type str")
             return new_name
 
     def url_converter(
@@ -47,7 +48,7 @@ class RelayStaticFilesStorage(CompressedManifestStaticFilesStorage):
         Convert Next.js source map URL to absolute URL.
 
         If this changes, or other django.contrib.staticfiles changes adjust CSS output,
-        then update the cache version in globals.scss and tokens.scss to bust the cache.
+        then update the cache version in globals.scss and colors.scss to bust the cache.
         """
         if (
             name.startswith("_next/static/css/")

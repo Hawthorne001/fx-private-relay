@@ -1,11 +1,10 @@
 module.exports = {
   extends: [
     "eslint:recommended",
-    "plugin:@typescript-eslint/recommended",
     "plugin:jest-dom/recommended",
-    "next",
+    "next/core-web-vitals",
+    "next/typescript",
   ],
-  parser: "@typescript-eslint/parser",
   plugins: ["@typescript-eslint", "testing-library", "jest-dom"],
   rules: {
     // We export the Next.js app to static HTML,
@@ -14,7 +13,11 @@ module.exports = {
     // Unused vars that start with an understore are allowed to be unused:
     "@typescript-eslint/no-unused-vars": [
       "warn",
-      { argsIgnorePattern: "^_", varsIgnorePattern: "^_" },
+      {
+        argsIgnorePattern: "^_",
+        varsIgnorePattern: "^_",
+        caughtErrorsIgnorePattern: "^_",
+      },
     ],
     // Weirdly this rule does not get set by ESLint's recommended ruleset,
     // but we try to avoid implicitly casting values (see e.g. reviews of

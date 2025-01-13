@@ -1,35 +1,36 @@
 from __future__ import annotations
+
 import base64
 import contextlib
-from email.errors import InvalidHeaderDefect
+import json
+import logging
+import pathlib
+import re
+import zlib
+from collections.abc import Callable
+from email.errors import HeaderParseError, InvalidHeaderDefect
 from email.headerregistry import Address, AddressHeader
 from email.message import EmailMessage
 from email.utils import formataddr, parseaddr
 from functools import cache
-from typing import cast, Any, TypeVar
-from collections.abc import Callable
-import json
-import pathlib
-import re
-from django.template.loader import render_to_string
-from django.utils.text import Truncator
-import requests
-
-from botocore.exceptions import ClientError
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
-from mypy_boto3_ses.type_defs import ContentTypeDef, SendRawEmailResponseTypeDef
-import jwcrypto.jwe
-import jwcrypto.jwk
-import markus
-import logging
+from typing import Any, Literal, TypeVar, cast
 from urllib.parse import quote_plus, urlparse
 
 from django.conf import settings
 from django.contrib.auth.models import Group, User
 from django.template.defaultfilters import linebreaksbr, urlize
+from django.template.loader import render_to_string
+from django.utils.text import Truncator
 
+import jwcrypto.jwe
+import jwcrypto.jwk
+import markus
+import requests
 from allauth.socialaccount.models import SocialAccount
+from botocore.exceptions import ClientError
+from cryptography.hazmat.primitives import hashes
+from cryptography.hazmat.primitives.kdf.hkdf import HKDFExpand
+from mypy_boto3_ses.type_defs import ContentTypeDef, SendRawEmailResponseTypeDef
 
 from privaterelay.plans import get_bundle_country_language_mapping
 from privaterelay.utils import get_countries_info_from_lang_and_mapping
@@ -53,7 +54,9 @@ def ses_message_props(data: str) -> ContentTypeDef:
     return {"Charset": "UTF-8", "Data": data}
 
 
-def get_domains_from_settings():
+def get_domains_from_settings() -> (
+    dict[Literal["RELAY_FIREFOX_DOMAIN", "MOZMAIL_DOMAIN"], str]
+):
     # HACK: detect if code is running in django tests
     if "testserver" in settings.ALLOWED_HOSTS:
         return {"RELAY_FIREFOX_DOMAIN": "default.com", "MOZMAIL_DOMAIN": "test.com"}
@@ -83,7 +86,7 @@ def get_trackers(level):
 
 def download_trackers(repo_url, category="Email"):
     # email tracker lists from shavar-prod-list as per agreed use under license:
-    resp = requests.get(repo_url)
+    resp = requests.get(repo_url, timeout=10)
     json_resp = resp.json()
     formatted_trackers = json_resp["categories"][category]
     trackers = []
@@ -196,7 +199,8 @@ def _get_hero_img_src(lang_code):
     if major_lang in avail_l10n_image_codes:
         img_locale = major_lang
 
-    assert settings.SITE_ORIGIN
+    if not settings.SITE_ORIGIN:
+        raise ValueError("settings.SITE_ORIGIN must have a value")
     return (
         settings.SITE_ORIGIN
         + f"/static/images/email-images/first-time-user/hero-image-{img_locale}.png"
@@ -227,8 +231,11 @@ def ses_send_raw_email(
     destination_address: str,
     message: EmailMessage,
 ) -> SendRawEmailResponseTypeDef:
-    assert (client := ses_client()) is not None
-    assert settings.AWS_SES_CONFIGSET
+    client = ses_client()
+    if client is None:
+        raise ValueError("client must have a value")
+    if not settings.AWS_SES_CONFIGSET:
+        raise ValueError("settings.AWS_SES_CONFIGSET must have a value")
 
     data = message.as_string()
     try:
@@ -253,7 +260,7 @@ def get_reply_to_address(premium: bool = True) -> str:
     """Return the address that relays replies."""
     if premium:
         _, reply_to_address = parseaddr(
-            "replies@%s" % get_domains_from_settings().get("RELAY_FIREFOX_DOMAIN")
+            "replies@{}".format(get_domains_from_settings().get("RELAY_FIREFOX_DOMAIN"))
         )
     else:
         _, reply_to_address = parseaddr(settings.RELAY_FROM_ADDRESS)
@@ -294,7 +301,7 @@ def generate_from_header(original_from_address: str, relay_mask: str) -> str:
     display_name, original_address = parseaddr(oneline_from_address)
     try:
         parsed_address = Address(addr_spec=original_address)
-    except (InvalidHeaderDefect, IndexError) as e:
+    except (InvalidHeaderDefect, IndexError, HeaderParseError) as e:
         # TODO: MPP-3407, MPP-3417 - Determine how to handle these
         raise InvalidFromHeader from e
 
@@ -324,7 +331,7 @@ def b64_lookup_key(lookup_key: bytes) -> str:
 
 
 def derive_reply_keys(message_id: bytes) -> tuple[bytes, bytes]:
-    """Derive the lookup key and encrytion key from an aliased message id."""
+    """Derive the lookup key and encryption key from an aliased message id."""
     algorithm = hashes.SHA256()
     hkdf = HKDFExpand(algorithm=algorithm, length=16, info=b"replay replies lookup key")
     lookup_key = hkdf.derive(message_id)
@@ -391,7 +398,9 @@ def _get_bucket_and_key_from_s3_json(message_json):
 @time_if_enabled("s3_get_message_content")
 def get_message_content_from_s3(bucket, object_key):
     if bucket and object_key:
-        assert (client := s3_client()) is not None
+        client = s3_client()
+        if client is None:
+            raise ValueError("client must not be None")
         streamed_s3_object = client.get_object(Bucket=bucket, Key=object_key).get(
             "Body"
         )
@@ -403,7 +412,9 @@ def remove_message_from_s3(bucket, object_key):
     if bucket is None or object_key is None:
         return False
     try:
-        assert (client := s3_client()) is not None
+        client = s3_client()
+        if client is None:
+            raise ValueError("client must not be None")
         response = client.delete_object(Bucket=bucket, Key=object_key)
         return response.get("DeleteMarker")
     except ClientError as e:
@@ -501,3 +512,28 @@ def remove_trackers(html_content, from_address, datetime_now, level="general"):
         extra=logger_details,
     )
     return changed_content, tracker_details
+
+
+def encode_dict_gza85(data: dict[str, Any]) -> str:
+    """
+    Encode a dict to the compressed Ascii85 format
+
+    The dict will be JSON-encoded will be compressed, Ascii85-encoded with padding, and
+    split by newlines into 1024-bytes chunks. This can be used to ensure it fits into
+    a GCP log entry, which has a 64KB limit per label value.
+    """
+    return base64.a85encode(
+        zlib.compress(json.dumps(data).encode()), wrapcol=1024, pad=True
+    ).decode("ascii")
+
+
+def decode_dict_gza85(encoded_data: str) -> dict[str, Any]:
+    """Decode a dict encoded with _encode_dict_gza85."""
+    data = json.loads(
+        zlib.decompress(base64.a85decode(encoded_data.encode("ascii"))).decode()
+    )
+    if not isinstance(data, dict):
+        raise ValueError("Encoded data is not a dict")
+    if any(not isinstance(key, str) for key in data):
+        raise ValueError("Encoded data has non-str key")
+    return data

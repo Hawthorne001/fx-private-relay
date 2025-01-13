@@ -4,13 +4,12 @@ from __future__ import annotations
 
 from django.contrib.auth.models import User
 
-from model_bakery import baker
 import pytest
+from model_bakery import baker
 
-from emails.cleaners import ServerStorageCleaner, MissingProfileCleaner
+from emails.cleaners import MissingProfileCleaner, ServerStorageCleaner
 from emails.models import DomainAddress, RelayAddress
-
-from .models_tests import make_premium_test_user, make_storageless_test_user
+from privaterelay.tests.utils import make_premium_test_user, make_storageless_test_user
 
 
 def setup_server_storage_test_data(

@@ -32,13 +32,13 @@ import {
   InvalidIcon,
 } from "../../Icons";
 import { Button } from "../../Button";
+import Image from "../../Image";
 import { InfoTooltip } from "../../InfoTooltip";
 import { useL10n } from "../../../hooks/l10n";
 import { ProfileData, useProfiles } from "../../../hooks/api/profile";
 import { getRuntimeConfig } from "../../../config";
 import { MenuTriggerState, useMenuTriggerState } from "react-stately";
 import { AliasData } from "../../../hooks/api/aliases";
-import Image from "next/image";
 import { ReactLocalization } from "@fluent/react";
 
 export type Props = {
@@ -153,9 +153,11 @@ const CustomMaskCreator = (props: CustomMaskCreatorProps) => {
     event.preventDefault();
 
     const isValid = isAddressValid(address);
-    isValid
-      ? onPick(address.toLowerCase(), errorExplainerState.setOpen)
-      : errorExplainerState.setOpen(!isValid);
+    if (isValid) {
+      onPick(address.toLowerCase(), errorExplainerState.setOpen);
+    } else {
+      errorExplainerState.setOpen(!isValid);
+    }
   };
   const onChange: ChangeEventHandler<HTMLInputElement> = (event) => {
     setAddress(event.target.value);

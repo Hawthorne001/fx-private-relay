@@ -1,28 +1,20 @@
-from datetime import datetime, timezone
-from typing import Any, NamedTuple
-from logging import LogRecord
-from uuid import UUID, uuid4
 import json
+from datetime import UTC, datetime
+from logging import LogRecord
+from pathlib import Path
+from typing import Any, NamedTuple
+from uuid import UUID, uuid4
 
-from django.test import RequestFactory
 from django.contrib.auth.models import User
+from django.test import RequestFactory
 
+import pytest
 from allauth.socialaccount.models import SocialAccount
 from model_bakery import baker
 from pytest_django.fixtures import SettingsWrapper
-import pytest
 
-from api.serializers import RelayAddressSerializer
+from api.serializers.emails import RelayAddressSerializer
 from emails.models import RelayAddress
-from emails.tests.models_tests import (
-    make_free_test_user,
-    make_premium_test_user,
-    phone_subscription,
-    vpn_subscription,
-)
-from privaterelay.types import RELAY_CHANNEL_NAME
-from privaterelay.utils import glean_logger as utils_glean_logger
-from privaterelay.tests.utils import create_expected_glean_event
 from privaterelay.glean_interface import (
     EmailBlockedReason,
     EmailMaskData,
@@ -30,16 +22,25 @@ from privaterelay.glean_interface import (
     RequestData,
     UserData,
 )
+from privaterelay.tests.utils import (
+    create_expected_glean_event,
+    make_free_test_user,
+    make_premium_test_user,
+    phone_subscription,
+    vpn_subscription,
+)
+from privaterelay.types import RELAY_CHANNEL_NAME
+from privaterelay.utils import glean_logger as utils_glean_logger
 
 
 @pytest.fixture
-def glean_logger(db, version_json_path) -> RelayGleanLogger:
+def glean_logger(db: None, version_json_path: Path) -> RelayGleanLogger:
     utils_glean_logger.cache_clear()  # Ensure version is from version_json_path
     return utils_glean_logger()
 
 
 @pytest.fixture
-def optout_user(db) -> User:
+def optout_user(db: None) -> User:
     user = baker.make(User, email="optout@example.com")
     SocialAccount.objects.get_or_create(
         user=user,
@@ -105,20 +106,20 @@ def test_user_data_free_user() -> None:
     assert user_data.date_joined_premium is None
     assert user_data.premium_status == "free"
     assert user_data.has_extension is False
-    assert user_data.date_got_extension is None
+    assert user_data.date_got_extension == datetime.min
 
 
 @pytest.mark.django_db
 def test_user_data_addon_user() -> None:
     """Data is extracted for a free user of the add-on."""
     user = make_free_test_user()
-    ra = user.relayaddress_set.create(generated_for="example.com")
+    user.relayaddress_set.create(generated_for="example.com")
 
     user_data = UserData.from_user(user)
 
     assert user_data.n_random_masks == 1
-    assert user_data.has_extension is True
-    assert user_data.date_got_extension == ra.created_at
+    assert user_data.has_extension is False
+    assert user_data.date_got_extension == datetime.min
 
 
 @pytest.mark.django_db
@@ -163,7 +164,7 @@ def test_user_data_vpn_user() -> None:
     assert user_data.premium_status == "bundle_unknown"
 
 
-def test_user_data_optout_user(optout_user) -> None:
+def test_user_data_optout_user(optout_user: User) -> None:
     user_data = UserData.from_user(optout_user)
     assert user_data.metrics_enabled is False
 
@@ -175,7 +176,6 @@ def test_email_mask_relay_address() -> None:
 
     mask_data = EmailMaskData.from_mask(mask)
 
-    assert mask_data.mask_id == mask.metrics_id
     assert mask_data.is_random_mask is True
     assert mask_data.has_website is False
 
@@ -199,7 +199,6 @@ def test_email_mask_domain_address() -> None:
 
     mask_data = EmailMaskData.from_mask(mask)
 
-    assert mask_data.mask_id == mask.metrics_id
     assert mask_data.is_random_mask is False
     assert mask_data.has_website is False
 
@@ -270,7 +269,7 @@ def extract_parts_from_payload(payload: dict[str, Any]) -> PayloadVariedParts:
     start_time_iso = payload["ping_info"]["start_time"]
     start_time = datetime.fromisoformat(start_time_iso)
     # The start_time is in ISO 8601 format with timezone data. Check the conversion.
-    assert 0 < (datetime.now(timezone.utc) - start_time).total_seconds() < 0.5
+    assert 0 < (datetime.now(UTC) - start_time).total_seconds() < 0.5
 
     telemetry_sdk_build = payload["client_info"]["telemetry_sdk_build"]
     # The version will change with glean_parser releases, so only check prefix
@@ -307,7 +306,6 @@ def test_log_email_mask_created(
         name="created",
         extra_items={
             "n_random_masks": "1",
-            "mask_id": address.metrics_id,
             "is_random_mask": "true",
             "has_website": "false",
             "created_by_api": "true",
@@ -367,7 +365,6 @@ def test_log_email_mask_label_updated(
         name="label_updated",
         extra_items={
             "n_random_masks": "1",
-            "mask_id": address.metrics_id,
             "is_random_mask": "true",
         },
         user=user,
@@ -408,13 +405,10 @@ def test_log_email_mask_deleted(
     """Check that log_email_mask_deleted results in a Glean server-side log."""
     user = make_free_test_user()
     address = baker.make(RelayAddress, user=user)
-    mask_id = address.metrics_id
     request = rf.delete(f"/api/v1/relayaddresses/{address.id}/")
     address.delete()  # Real request will delete the mask before glean event
 
-    glean_logger.log_email_mask_deleted(
-        user=user, mask_id=mask_id, is_random_mask=True, request=request
-    )
+    glean_logger.log_email_mask_deleted(user=user, is_random_mask=True, request=request)
     # Check the one glean-server-event log
     assert len(caplog.records) == 1
     record = caplog.records[0]
@@ -428,8 +422,8 @@ def test_log_email_mask_deleted(
         name="deleted",
         extra_items={
             "n_random_masks": "0",
-            "mask_id": mask_id,
             "is_random_mask": "true",
+            "n_deleted_random_masks": "1",
         },
         user=user,
         event_time=parts.event_timestamp_ms,
@@ -448,14 +442,11 @@ def test_log_email_mask_deleted_with_opt_out(
 ) -> None:
     """A log is not emitted for mask deletion when the user has opted-out of metrics"""
     address = baker.make(RelayAddress, user=optout_user)
-    mask_id = address.metrics_id
     user = address.user
     request = rf.delete(f"/api/v1/relayaddresses/{address.id}/")
     address.delete()  # Real request will delete the mask before glean event
 
-    glean_logger.log_email_mask_deleted(
-        user=user, mask_id=mask_id, is_random_mask=True, request=request
-    )
+    glean_logger.log_email_mask_deleted(user=user, is_random_mask=True, request=request)
     assert len(caplog.records) == 0
 
 
@@ -485,7 +476,6 @@ def test_log_email_forwarded(
         name="forwarded",
         extra_items={
             "n_random_masks": "1",
-            "mask_id": address.metrics_id,
             "is_random_mask": "true",
             "is_reply": "true" if is_reply else "false",
         },
@@ -537,7 +527,6 @@ def test_log_email_blocked(
         name="blocked",
         extra_items={
             "n_random_masks": "1",
-            "mask_id": address.metrics_id,
             "is_random_mask": "true",
             "is_reply": "true" if is_reply else "false",
             "reason": reason,

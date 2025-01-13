@@ -3,13 +3,19 @@ CommandFromDjangoSettings is a base class for commands that get parameters from 
 settings.
 """
 
+import textwrap
 from argparse import RawDescriptionHelpFormatter
 from collections import namedtuple
 from shutil import get_terminal_size
-import textwrap
+from typing import Any
 
 from django.conf import settings
-from django.core.management.base import BaseCommand, CommandError, DjangoHelpFormatter
+from django.core.management.base import (
+    BaseCommand,
+    CommandError,
+    CommandParser,
+    DjangoHelpFormatter,
+)
 
 
 class RawDescriptionDjangoHelpFormatter(
@@ -30,14 +36,17 @@ class CommandFromDjangoSettings(BaseCommand):
 
     settings_to_locals: list[SettingToLocal]
 
-    def create_parser(self, prog_name, subcommand, **kwargs):
+    def create_parser(
+        self, prog_name: str, subcommand: str, **kwargs: Any
+    ) -> CommandParser:
         """
         Customize the default parser.
 
         * Add the Django settings and their values to the command help
         * Override the verbosity from an environment variable
         """
-        assert self.settings_to_locals
+        if not self.settings_to_locals:
+            raise ValueError("self.settings_to_locals must be truthy value.")
         epilog_lines = [
             (
                 "Parameters are read from Django settings and the related environment"
@@ -65,15 +74,18 @@ class CommandFromDjangoSettings(BaseCommand):
         epilog = "\n".join(epilog_lines)
 
         parser = super().create_parser(prog_name, subcommand, epilog=epilog, **kwargs)
-        assert parser.formatter_class == DjangoHelpFormatter
+        if parser.formatter_class != DjangoHelpFormatter:
+            raise TypeError("parser.formatter_class must be DjangoHelpFormatter")
         parser.formatter_class = RawDescriptionDjangoHelpFormatter
-        assert verbosity_override is not None
+        if verbosity_override is None:
+            raise ValueError("verbosity_override must not be None.")
         parser.set_defaults(verbosity=verbosity_override)
         return parser
 
-    def init_from_settings(self, verbosity):
+    def init_from_settings(self, verbosity: int) -> None:
         """Initialize local variables from settings"""
-        assert self.settings_to_locals
+        if not self.settings_to_locals:
+            raise ValueError("self.settings_to_locals must be truthy value.")
         for setting_key, local_name, help_str, validator in self.settings_to_locals:
             value = getattr(settings, setting_key)
             if not validator(value):

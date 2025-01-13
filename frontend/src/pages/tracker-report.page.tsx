@@ -1,6 +1,6 @@
 import { NextPage } from "next";
 import { useEffect, useState } from "react";
-import Image from "next/image";
+import Image from "../components/Image";
 import styles from "./tracker-report.module.scss";
 import LogoType from "./images/fx-private-relay-logotype-dark.svg";
 import Logo from "./images/placeholder-logo.svg";
@@ -246,7 +246,7 @@ function parseHash(hash: string): ReportData | null {
       received_at: data.received_at,
       trackers: data.trackers,
     };
-  } catch (e) {
+  } catch (_e) {
     return null;
   }
 }

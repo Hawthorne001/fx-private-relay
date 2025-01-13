@@ -1,20 +1,19 @@
 import logging
-
-from mypy_boto3_ses.type_defs import ContentTypeDef
-
-from botocore.exceptions import ClientError
+from typing import Any
 
 from django.apps import apps
 from django.conf import settings
 from django.core.management.base import BaseCommand
 
-from allauth.socialaccount.models import SocialAccount
 import django_ftl
+from allauth.socialaccount.models import SocialAccount
+from botocore.exceptions import ClientError
+from mypy_boto3_ses.type_defs import ContentTypeDef
 
 from emails.apps import EmailsConfig
-from emails.models import Profile
 from emails.utils import get_welcome_email, ses_message_props
 from privaterelay.ftl_bundles import main as ftl_bundle
+from privaterelay.models import Profile
 
 logger = logging.getLogger("eventsinfo.send_welcome_emails")
 
@@ -22,7 +21,7 @@ logger = logging.getLogger("eventsinfo.send_welcome_emails")
 class Command(BaseCommand):
     help = "Send the welcome email to all users who haven't received it yet."
 
-    def handle(self, verbosity, *args, **kwargs):
+    def handle(self, *args: Any, **kwargs: Any) -> None:
         logger.info("Starting send_welcome_emails")
         profiles_without_welcome_email = Profile.objects.filter(
             sent_welcome_email=False
@@ -38,13 +37,16 @@ def _ses_message_props(data: str) -> ContentTypeDef:
     return {"Charset": "UTF-8", "Data": data}
 
 
-def send_welcome_email(profile: Profile, **kwargs):
+def send_welcome_email(profile: Profile) -> None:
     user = profile.user
     app_config = apps.get_app_config("emails")
-    assert isinstance(app_config, EmailsConfig)
+    if not isinstance(app_config, EmailsConfig):
+        raise TypeError("app_config must be type EmailsConfig")
     ses_client = app_config.ses_client
-    assert ses_client
-    assert settings.RELAY_FROM_ADDRESS
+    if not ses_client:
+        raise ValueError("ses_client must be truthy value")
+    if not settings.RELAY_FROM_ADDRESS:
+        raise ValueError("settings.RELAY_FROM_ADDRESS must be truthy value.")
     with django_ftl.override(profile.language):
         translated_subject = ftl_bundle.format("first-time-user-email-welcome")
     try:

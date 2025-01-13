@@ -1,23 +1,23 @@
 from __future__ import annotations
-from datetime import datetime, timedelta, timezone
-from math import floor
-from typing import Optional
-from collections.abc import Iterator
+
 import logging
-import phonenumbers
 import secrets
 import string
+from collections.abc import Iterator
+from datetime import UTC, datetime, timedelta
+from math import floor
 
-from django.contrib.auth.models import User
 from django.conf import settings
+from django.contrib.auth.models import User
 from django.core.cache import cache
 from django.core.exceptions import BadRequest, ValidationError
-from django.db.migrations.recorder import MigrationRecorder
 from django.db import models
+from django.db.migrations.recorder import MigrationRecorder
 from django.db.models.signals import post_save
 from django.dispatch.dispatcher import receiver
 from django.urls import reverse
 
+import phonenumbers
 from twilio.base.exceptions import TwilioRestException
 from twilio.rest import Client
 
@@ -27,6 +27,7 @@ from .apps import phones_config, twilio_client
 from .iq_utils import send_iq_sms
 
 logger = logging.getLogger("eventsinfo")
+events_logger = logging.getLogger("events")
 
 
 MAX_MINUTES_TO_VERIFY_REAL_PHONE = 5
@@ -34,6 +35,7 @@ LAST_CONTACT_TYPE_CHOICES = [
     ("call", "call"),
     ("text", "text"),
 ]
+DEFAULT_REGION = "US"
 
 
 def verification_code_default():
@@ -41,49 +43,7 @@ def verification_code_default():
 
 
 def verification_sent_date_default():
-    return datetime.now(timezone.utc)
-
-
-def get_expired_unverified_realphone_records(number):
-    return RealPhone.objects.filter(
-        number=number,
-        verified=False,
-        verification_sent_date__lt=(
-            datetime.now(timezone.utc)
-            - timedelta(0, 60 * settings.MAX_MINUTES_TO_VERIFY_REAL_PHONE)
-        ),
-    )
-
-
-def get_pending_unverified_realphone_records(number):
-    return RealPhone.objects.filter(
-        number=number,
-        verified=False,
-        verification_sent_date__gt=(
-            datetime.now(timezone.utc)
-            - timedelta(0, 60 * settings.MAX_MINUTES_TO_VERIFY_REAL_PHONE)
-        ),
-    )
-
-
-def get_verified_realphone_records(user):
-    return RealPhone.objects.filter(user=user, verified=True)
-
-
-def get_verified_realphone_record(number):
-    return RealPhone.objects.filter(number=number, verified=True).first()
-
-
-def get_valid_realphone_verification_record(user, number, verification_code):
-    return RealPhone.objects.filter(
-        user=user,
-        number=number,
-        verification_code=verification_code,
-        verification_sent_date__gt=(
-            datetime.now(timezone.utc)
-            - timedelta(0, 60 * settings.MAX_MINUTES_TO_VERIFY_REAL_PHONE)
-        ),
-    ).first()
+    return datetime.now(UTC)
 
 
 def get_last_text_sender(relay_number: RelayNumber) -> InboundContact | None:
@@ -125,6 +85,73 @@ def iq_fmt(e164_number: str) -> str:
     return "1" + str(phonenumbers.parse(e164_number, "E164").national_number)
 
 
+class VerifiedRealPhoneManager(models.Manager["RealPhone"]):
+    """Return verified RealPhone records."""
+
+    def get_queryset(self) -> models.query.QuerySet[RealPhone]:
+        return super().get_queryset().filter(verified=True)
+
+    def get_for_user(self, user: User) -> RealPhone:
+        """Get the one verified RealPhone for the user, or raise DoesNotExist."""
+        return self.get(user=user)
+
+    def exists_for_number(self, number: str) -> bool:
+        """Return True if a verified RealPhone exists for this number."""
+        return self.filter(number=number).exists()
+
+    def country_code_for_user(self, user: User) -> str:
+        """Return the RealPhone country code for this user."""
+        return self.values_list("country_code", flat=True).get(user=user)
+
+
+class ExpiredRealPhoneManager(models.Manager["RealPhone"]):
+    """Return RealPhone records where the sent verification is no longer valid."""
+
+    def get_queryset(self) -> models.query.QuerySet[RealPhone]:
+        return (
+            super()
+            .get_queryset()
+            .filter(
+                verified=False,
+                verification_sent_date__lt=RealPhone.verification_expiration(),
+            )
+        )
+
+    def delete_for_number(self, number: str) -> tuple[int, dict[str, int]]:
+        return self.filter(number=number).delete()
+
+
+class RecentRealPhoneManager(models.Manager["RealPhone"]):
+    """Return RealPhone records where the sent verification is still valid."""
+
+    def get_queryset(self) -> models.query.QuerySet[RealPhone]:
+        return (
+            super()
+            .get_queryset()
+            .filter(
+                verified=False,
+                verification_sent_date__gte=RealPhone.verification_expiration(),
+            )
+        )
+
+    def get_for_user_number_and_verification_code(
+        self, user: User, number: str, verification_code: str
+    ) -> RealPhone:
+        """Get the RealPhone with this user, number, and recently sent code, or raise"""
+        return self.get(user=user, number=number, verification_code=verification_code)
+
+
+class PendingRealPhoneManager(RecentRealPhoneManager):
+    """Return unverified RealPhone records where verification is still valid."""
+
+    def get_queryset(self) -> models.query.QuerySet[RealPhone]:
+        return super().get_queryset().filter(verified=False)
+
+    def exists_for_number(self, number: str) -> bool:
+        """Return True if a verified RealPhone exists for this number."""
+        return self.filter(number=number).exists()
+
+
 class RealPhone(models.Model):
     user = models.ForeignKey(User, on_delete=models.CASCADE)
     number = models.CharField(max_length=15)
@@ -136,7 +163,13 @@ class RealPhone(models.Model):
     )
     verified = models.BooleanField(default=False)
     verified_date = models.DateTimeField(blank=True, null=True)
-    country_code = models.CharField(max_length=2, default="US")
+    country_code = models.CharField(max_length=2, default=DEFAULT_REGION)
+
+    objects = models.Manager()
+    verified_objects = VerifiedRealPhoneManager()
+    expired_objects = ExpiredRealPhoneManager()
+    recent_objects = RecentRealPhoneManager()
+    pending_objects = PendingRealPhoneManager()
 
     class Meta:
         constraints = [
@@ -147,29 +180,31 @@ class RealPhone(models.Model):
             )
         ]
 
+    @classmethod
+    def verification_expiration(self) -> datetime:
+        return datetime.now(UTC) - timedelta(
+            0, 60 * settings.MAX_MINUTES_TO_VERIFY_REAL_PHONE
+        )
+
     def save(self, *args, **kwargs):
         # delete any expired unverified RealPhone records for this number
         # note: it doesn't matter which user is trying to create a new
         # RealPhone record - any expired unverified record for the number
         # should be deleted
-        expired_verification_records = get_expired_unverified_realphone_records(
-            self.number
-        )
-        expired_verification_records.delete()
+        RealPhone.expired_objects.delete_for_number(self.number)
 
         # We are not ready to support multiple real phone numbers per user,
         # so raise an exception if this save() would create a second
         # RealPhone record for the user
-        user_verified_number_records = get_verified_realphone_records(self.user)
-        for verified_number in user_verified_number_records:
-            if (
+        try:
+            verified_number = RealPhone.verified_objects.get_for_user(self.user)
+            if not (
                 verified_number.number == self.number
                 and verified_number.verification_code == self.verification_code
             ):
-                # User is verifying the same number twice
-                return super().save(*args, **kwargs)
-            else:
                 raise BadRequest("User already has a verified number.")
+        except RealPhone.DoesNotExist:
+            pass
 
         # call super save to save into the DB
         # See also: realphone_post_save receiver below
@@ -178,7 +213,7 @@ class RealPhone(models.Model):
     def mark_verified(self):
         incr_if_enabled("phones_RealPhone.mark_verified")
         self.verified = True
-        self.verified_date = datetime.now(timezone.utc)
+        self.verified_date = datetime.now(UTC)
         self.save(force_update=True)
         return self
 
@@ -186,7 +221,7 @@ class RealPhone(models.Model):
 @receiver(post_save, sender=RealPhone, dispatch_uid="realphone_post_save")
 def realphone_post_save(sender, instance, created, **kwargs):
     # don't do anything if running migrations
-    if type(instance) == MigrationRecorder.Migration:
+    if isinstance(instance, MigrationRecorder.Migration):
         return
 
     if created:
@@ -219,7 +254,7 @@ class RelayNumber(models.Model):
     number = models.CharField(max_length=15, db_index=True, unique=True)
     vendor = models.CharField(max_length=15, default="twilio")
     location = models.CharField(max_length=255)
-    country_code = models.CharField(max_length=2, default="US")
+    country_code = models.CharField(max_length=2, default=DEFAULT_REGION)
     vcard_lookup_key = models.CharField(
         max_length=6, default=vcard_lookup_key_default, unique=True
     )
@@ -235,16 +270,16 @@ class RelayNumber(models.Model):
     created_at = models.DateTimeField(null=True, auto_now_add=True)
 
     @property
-    def remaining_minutes(self):
+    def remaining_minutes(self) -> int:
         # return a 0 or positive int for remaining minutes
         return floor(max(self.remaining_seconds, 0) / 60)
 
     @property
-    def calls_and_texts_forwarded(self):
+    def calls_and_texts_forwarded(self) -> int:
         return self.calls_forwarded + self.texts_forwarded
 
     @property
-    def calls_and_texts_blocked(self):
+    def calls_and_texts_blocked(self) -> int:
         return self.calls_blocked + self.texts_blocked
 
     @property
@@ -252,8 +287,9 @@ class RelayNumber(models.Model):
         return bool(self.user.profile.store_phone_log)
 
     def save(self, *args, **kwargs):
-        realphone = get_verified_realphone_records(self.user).first()
-        if not realphone:
+        try:
+            realphone = RealPhone.verified_objects.get(user=self.user)
+        except RealPhone.DoesNotExist:
             raise ValidationError("User does not have a verified real phone.")
 
         # if this number exists for this user, this is an update call
@@ -290,13 +326,13 @@ class RelayNumber(models.Model):
         # as realphone
         self.country_code = realphone.country_code.upper()
 
-        # Add US numbers to the Relay messaging service, so it goes into our
-        # US A2P 10DLC campaign
-        if use_twilio and self.country_code == "US":
+        # Add numbers to the Relay messaging service, so it goes into our
+        # A2P 10DLC campaigns
+        if use_twilio and self.country_code in settings.TWILIO_NEEDS_10DLC_CAMPAIGN:
             if settings.TWILIO_MESSAGING_SERVICE_SID:
                 register_with_messaging_service(client, twilio_incoming_number.sid)
             else:
-                logger.warning(
+                events_logger.warning(
                     "Skipping Twilio Messaging Service registration, since"
                     " TWILIO_MESSAGING_SERVICE_SID is empty.",
                     extra={"number_sid": twilio_incoming_number.sid},
@@ -328,7 +364,11 @@ class CachedList:
 def register_with_messaging_service(client: Client, number_sid: str) -> None:
     """Register a Twilio US phone number with a Messaging Service."""
 
-    assert settings.TWILIO_MESSAGING_SERVICE_SID
+    if not settings.TWILIO_MESSAGING_SERVICE_SID:
+        raise ValueError(
+            "settings.TWILIO_MESSAGING_SERVICE_SID must contain a value when calling "
+            "register_with_messaging_service"
+        )
 
     closed_sids = CachedList("twilio_messaging_service_closed")
 
@@ -350,16 +390,16 @@ def register_with_messaging_service(client: Client, number_sid: str) -> None:
             if err.status == 409 and err.code == 21710:
                 # Log "Phone Number is already in the Messaging Service"
                 # https://www.twilio.com/docs/api/errors/21710
-                logger.warning("twilio_messaging_service", extra=log_extra)
+                events_logger.warning("twilio_messaging_service", extra=log_extra)
                 return
             elif err.status == 412 and err.code == 21714:
                 # Log "Number Pool size limit reached", continue to next service
                 # https://www.twilio.com/docs/api/errors/21714
                 closed_sids.append(service_sid)
-                logger.warning("twilio_messaging_service", extra=log_extra)
+                events_logger.warning("twilio_messaging_service", extra=log_extra)
             else:
                 # Log and re-raise other Twilio errors
-                logger.error("twilio_messaging_service", extra=log_extra)
+                events_logger.error("twilio_messaging_service", extra=log_extra)
                 raise
         else:
             return  # Successfully registered with service
@@ -370,7 +410,7 @@ def register_with_messaging_service(client: Client, number_sid: str) -> None:
 @receiver(post_save, sender=RelayNumber)
 def relaynumber_post_save(sender, instance, created, **kwargs):
     # don't do anything if running migrations
-    if type(instance) == MigrationRecorder.Migration:
+    if isinstance(instance, MigrationRecorder.Migration):
         return
 
     # TODO: if IQ_FOR_NEW_NUMBERS, send welcome message via IQ
@@ -385,15 +425,20 @@ def relaynumber_post_save(sender, instance, created, **kwargs):
 
 
 def send_welcome_message(user, relay_number):
-    real_phone = RealPhone.objects.get(user=user)
-    assert settings.SITE_ORIGIN
+    real_phone = RealPhone.verified_objects.get(user=user)
+    if not settings.SITE_ORIGIN:
+        raise ValueError(
+            "settings.SITE_ORIGIN must contain a value when calling "
+            "send_welcome_message"
+        )
     media_url = settings.SITE_ORIGIN + reverse(
         "vCard", kwargs={"lookup_key": relay_number.vcard_lookup_key}
     )
     client = twilio_client()
     client.messages.create(
         body=(
-            "Welcome to Relay phone masking! 🎉 Please add your number to your contacts."
+            "Welcome to Relay phone masking!"
+            " 🎉 Please add your number to your contacts."
             " This will help you identify your Relay messages and calls."
         ),
         from_=settings.TWILIO_MAIN_NUMBER,
@@ -403,7 +448,7 @@ def send_welcome_message(user, relay_number):
 
 
 def last_inbound_date_default():
-    return datetime.now(timezone.utc)
+    return datetime.now(UTC)
 
 
 class InboundContact(models.Model):
@@ -429,8 +474,9 @@ class InboundContact(models.Model):
 
 
 def suggested_numbers(user):
-    real_phone = get_verified_realphone_records(user).first()
-    if real_phone is None:
+    try:
+        real_phone = RealPhone.verified_objects.get_for_user(user)
+    except RealPhone.DoesNotExist:
         raise BadRequest(
             "available_numbers: This user hasn't verified a RealPhone yet."
         )
@@ -448,7 +494,7 @@ def suggested_numbers(user):
     # TODO: can we make multiple pattern searches in a single Twilio API request
     same_prefix_options = []
     # look for numbers with same area code and 3-number prefix
-    contains = "%s****" % real_num[:8] if real_num else ""
+    contains = f"{real_num[:8]}****" if real_num else ""
     twilio_nums = avail_nums.local.list(contains=contains, limit=10)
     same_prefix_options.extend(convert_twilio_numbers_to_dict(twilio_nums))
 
@@ -458,17 +504,17 @@ def suggested_numbers(user):
     same_prefix_options.extend(convert_twilio_numbers_to_dict(twilio_nums))
 
     # look for numbers with same area code and 1-number prefix
-    contains = "%s******" % real_num[:6] if real_num else ""
+    contains = f"{real_num[:6]}******" if real_num else ""
     twilio_nums = avail_nums.local.list(contains=contains, limit=10)
     same_prefix_options.extend(convert_twilio_numbers_to_dict(twilio_nums))
 
     # look for same number in other area codes
-    contains = "+1***%s" % real_num[5:] if real_num else ""
+    contains = f"+1***{real_num[5:]}" if real_num else ""
     twilio_nums = avail_nums.local.list(contains=contains, limit=10)
     other_areas_options = convert_twilio_numbers_to_dict(twilio_nums)
 
     # look for any numbers in the area code
-    contains = "%s*******" % real_num[:5] if real_num else ""
+    contains = f"{real_num[:5]}*******" if real_num else ""
     twilio_nums = avail_nums.local.list(contains=contains, limit=10)
     same_area_options = convert_twilio_numbers_to_dict(twilio_nums)
 
@@ -485,14 +531,14 @@ def suggested_numbers(user):
     }
 
 
-def location_numbers(location, country_code="US"):
+def location_numbers(location, country_code=DEFAULT_REGION):
     client = twilio_client()
     avail_nums = client.available_phone_numbers(country_code)
     twilio_nums = avail_nums.local.list(in_locality=location, limit=10)
     return convert_twilio_numbers_to_dict(twilio_nums)
 
 
-def area_code_numbers(area_code, country_code="US"):
+def area_code_numbers(area_code, country_code=DEFAULT_REGION):
     client = twilio_client()
     avail_nums = client.available_phone_numbers(country_code)
     twilio_nums = avail_nums.local.list(area_code=area_code, limit=10)

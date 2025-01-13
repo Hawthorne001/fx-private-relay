@@ -1,10 +1,10 @@
-from datetime import datetime, timezone
-from functools import lru_cache
-from hashlib import sha256
-from typing import Any, Optional, TypedDict
-from collections.abc import Iterable
 import json
 import logging
+from collections.abc import Iterable
+from datetime import UTC, datetime
+from functools import cache
+from hashlib import sha256
+from typing import Any, TypedDict
 
 from django.apps import apps
 from django.conf import settings
@@ -14,29 +14,23 @@ from django.shortcuts import redirect
 from django.urls import reverse
 from django.views.decorators.csrf import csrf_exempt
 from django.views.decorators.http import require_http_methods
-from rest_framework.decorators import api_view, schema
 
+import jwt
+import sentry_sdk
 from allauth.socialaccount.models import SocialAccount, SocialApp
 from allauth.socialaccount.providers.fxa.views import FirefoxAccountsOAuth2Adapter
 from cryptography.hazmat.primitives.asymmetric.rsa import RSAPublicKey
-from google_measurement_protocol import event, report
+from markus.utils import generate_tag
 from oauthlib.oauth2.rfc6749.errors import CustomOAuth2Error
-import jwt
-import sentry_sdk
+from rest_framework.decorators import api_view, schema
 
-# from silk.profiling.profiler import silk_profile
-
-from emails.models import (
-    CannotMakeSubdomainException,
-    DomainAddress,
-    RelayAddress,
-    valid_available_subdomain,
-)
+from emails.models import DomainAddress, RelayAddress
 from emails.utils import incr_if_enabled
 
 from .apps import PrivateRelayConfig
-from .fxa_utils import _get_oauth2_session, NoSocialToken
-
+from .exceptions import CannotMakeSubdomainException
+from .fxa_utils import NoSocialToken, _get_oauth2_session
+from .validators import valid_available_subdomain
 
 FXA_PROFILE_CHANGE_EVENT = "https://schemas.accounts.firefox.com/event/profile-change"
 FXA_SUBSCRIPTION_CHANGE_EVENT = (
@@ -49,7 +43,7 @@ logger = logging.getLogger("events")
 info_logger = logging.getLogger("eventsinfo")
 
 
-@lru_cache(maxsize=None)
+@cache
 def _get_fxa(request):
     return request.user.socialaccount_set.filter(provider="fxa").first()
 
@@ -83,8 +77,8 @@ def profile_subdomain(request):
     try:
         if request.method == "GET":
             subdomain = request.GET.get("subdomain", None)
-            available = valid_available_subdomain(subdomain)
-            return JsonResponse({"available": available})
+            valid_available_subdomain(subdomain)
+            return JsonResponse({"available": True})
         else:
             subdomain = request.POST.get("subdomain", None)
             profile.add_subdomain(subdomain)
@@ -98,30 +92,36 @@ def profile_subdomain(request):
 
 @csrf_exempt
 @require_http_methods(["POST"])
-def metrics_event(request):
+def metrics_event(request: HttpRequest) -> JsonResponse:
+    """
+    Handle metrics events from the Relay extension.
+
+    This used to forward data to Google Analytics, but was not updated for GA4.
+
+    Now it logs the information and updates statsd counters.
+    """
     try:
         request_data = json.loads(request.body)
     except json.JSONDecodeError:
         return JsonResponse({"msg": "Could not decode JSON"}, status=415)
     if "ga_uuid" not in request_data:
         return JsonResponse({"msg": "No GA uuid found"}, status=404)
-    # "dimension5" is a Google Analytics-specific variable to track a custom dimension,
-    # used to determine which browser vendor the add-on is using: Firefox or Chrome
-    # "dimension7" is a Google Analytics-specific variable to track a custom dimension,
-    # used to determine where the ping is coming from: website (default), add-on or app
-    event_data = event(
-        request_data.get("category", None),
-        request_data.get("action", None),
-        request_data.get("label", None),
-        request_data.get("value", None),
-        dimension5=request_data.get("dimension5", None),
-        dimension7=request_data.get("dimension7", "website"),
-    )
-    try:
-        report(settings.GOOGLE_ANALYTICS_ID, request_data.get("ga_uuid"), event_data)
-    except Exception as e:
-        logger.error("metrics_event", extra={"error": e})
-        return JsonResponse({"msg": "Unable to report metrics event."}, status=500)
+    event_data = {
+        "ga_uuid_hash": sha256(request_data["ga_uuid"].encode()).hexdigest()[:16],
+        "category": request_data.get("category", None),
+        "action": request_data.get("action", None),
+        "label": request_data.get("label", None),
+        "value": request_data.get("value", None),
+        "browser": request_data.get("browser", None),  # dimension5 in GA
+        "source": request_data.get("dimension7", "website"),
+    }
+    info_logger.info("metrics_event", extra=event_data)
+    tags = [
+        generate_tag(key, val)
+        for key, val in event_data.items()
+        if val is not None and key != "ga_uuid_hash"
+    ]
+    incr_if_enabled("metrics_event", tags=tags)
     return JsonResponse({"msg": "OK"}, status=200)
 
 
@@ -132,9 +132,8 @@ def fxa_rp_events(request: HttpRequest) -> HttpResponse:
     event_keys = _get_event_keys_from_jwt(authentic_jwt)
     try:
         social_account = _get_account_from_jwt(authentic_jwt)
-    except SocialAccount.DoesNotExist as e:
-        # capture an exception in sentry, but don't error, or FXA will retry
-        sentry_sdk.capture_exception(e)
+    except SocialAccount.DoesNotExist:
+        # Don't error, or FXA will retry
         return HttpResponse("202 Accepted", status=202)
 
     for event_key in event_keys:
@@ -161,10 +160,21 @@ def _parse_jwt_from_request(request: HttpRequest) -> str:
 def fxa_verifying_keys(reload: bool = False) -> list[dict[str, Any]]:
     """Get list of FxA verifying (public) keys."""
     private_relay_config = apps.get_app_config("privaterelay")
-    assert isinstance(private_relay_config, PrivateRelayConfig)
+    if not isinstance(private_relay_config, PrivateRelayConfig):
+        raise TypeError("private_relay_config must be PrivateRelayConfig")
     if reload:
         private_relay_config.ready()
     return private_relay_config.fxa_verifying_keys
+
+
+def fxa_social_app(reload: bool = False) -> SocialApp:
+    """Get FxA SocialApp from app config or DB."""
+    private_relay_config = apps.get_app_config("privaterelay")
+    if not isinstance(private_relay_config, PrivateRelayConfig):
+        raise TypeError("private_relay_config must be PrivateRelayConfig")
+    if reload:
+        private_relay_config.ready()
+    return private_relay_config.fxa_social_app
 
 
 class FxAEvent(TypedDict):
@@ -203,11 +213,16 @@ def _verify_jwt_with_fxa_key(
 ) -> FxAEvent | None:
     if not verifying_keys:
         raise Exception("FXA verifying keys are not available.")
-    social_app = SocialApp.objects.get(provider="fxa")
+    social_app = fxa_social_app()
+    if not social_app:
+        raise Exception("FXA SocialApp is not available.")
+    if not isinstance(social_app, SocialApp):
+        raise TypeError("social_app must be SocialApp")
     for verifying_key in verifying_keys:
         if verifying_key["alg"] == "RS256":
             public_key = jwt.algorithms.RSAAlgorithm.from_jwk(json.dumps(verifying_key))
-            assert isinstance(public_key, RSAPublicKey)
+            if not isinstance(public_key, RSAPublicKey):
+                raise TypeError("public_key must be RSAPublicKey")
             try:
                 security_event = jwt.decode(
                     req_jwt,
@@ -227,7 +242,7 @@ def _verify_jwt_with_fxa_key(
                 iat = claims.get("iat")
                 iat_age = None
                 if iat:
-                    iat_age = round(datetime.now(tz=timezone.utc).timestamp() - iat, 3)
+                    iat_age = round(datetime.now(tz=UTC).timestamp() - iat, 3)
                 info_logger.warning(
                     "fxa_rp_event.future_iat", extra={"iat": iat, "iat_age_s": iat_age}
                 )
@@ -307,7 +322,7 @@ def _update_all_data(
             no_longer_premium = had_premium and not now_has_premium
             if newly_premium:
                 incr_if_enabled("user_purchased_premium", 1)
-                profile.date_subscribed = datetime.now(timezone.utc)
+                profile.date_subscribed = datetime.now(UTC)
                 profile.save()
             if no_longer_premium:
                 incr_if_enabled("user_has_downgraded", 1)
@@ -316,8 +331,8 @@ def _update_all_data(
             no_longer_phone = had_phone and not now_has_phone
             if newly_phone:
                 incr_if_enabled("user_purchased_phone", 1)
-                profile.date_subscribed_phone = datetime.now(timezone.utc)
-                profile.date_phone_subscription_reset = datetime.now(timezone.utc)
+                profile.date_subscribed_phone = datetime.now(UTC)
+                profile.date_phone_subscription_reset = datetime.now(UTC)
                 profile.save()
             if no_longer_phone:
                 incr_if_enabled("user_has_dropped_phone", 1)

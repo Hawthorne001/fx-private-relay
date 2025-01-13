@@ -15,7 +15,6 @@ import {
   useSliderThumb,
 } from "react-aria";
 import Link from "next/link";
-import Image from "next/image";
 import {
   SliderState,
   useOverlayTriggerState,
@@ -28,6 +27,7 @@ import UmbrellaSemi from "./images/umbrella-semi.svg";
 import UmbrellaSemiMobile from "./images/umbrella-semi-mobile.svg";
 import UmbrellaOpen from "./images/umbrella-open.svg";
 import UmbrellaOpenMobile from "./images/umbrella-open-mobile.svg";
+import Image from "../../Image";
 import { AliasData } from "../../../hooks/api/aliases";
 import { CloseIcon, LockIcon } from "../../Icons";
 import { useGaEvent } from "../../../hooks/gaEvent";
@@ -497,7 +497,7 @@ class SliderValueFormatter implements Intl.NumberFormat {
   formatRangeToParts(
     _startDate: number | bigint,
     _endDate: number | bigint,
-  ): Intl.NumberRangeFormatPart[] {
+  ): Intl.NumberFormatPart[] {
     throw new Error("Method not implemented.");
   }
 

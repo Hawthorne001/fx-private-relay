@@ -1,31 +1,31 @@
-import pytest
-from unittest.mock import MagicMock, patch
-
-from botocore.exceptions import ClientError
+from collections.abc import Iterator
+from typing import Any
+from unittest.mock import MagicMock, Mock, patch
 
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.management import call_command
 
-from allauth.socialaccount.models import SocialAccount
 import django_ftl
+import pytest
+from allauth.socialaccount.models import SocialAccount
+from botocore.exceptions import ClientError
 
-from emails.models import Profile
-from emails.tests.models_tests import make_free_test_user
 from privaterelay.ftl_bundles import main as ftl_bundle
-
+from privaterelay.models import Profile
+from privaterelay.tests.utils import make_free_test_user
 
 COMMAND_NAME = "send_welcome_emails"
 
 
 @pytest.fixture()
-def mock_ses_client():
+def mock_ses_client() -> Iterator[Mock]:
     with patch("emails.apps.EmailsConfig.ses_client") as mock_ses_client:
         yield mock_ses_client
 
 
 @pytest.mark.django_db
-def test_no_profiles_need_welcome_email(caplog: pytest.LogCaptureFixture):
+def test_no_profiles_need_welcome_email(caplog: pytest.LogCaptureFixture) -> None:
     profiles_without_welcome_email = Profile.objects.filter(sent_welcome_email=False)
     assert profiles_without_welcome_email.count() == 0
     call_command(COMMAND_NAME)
@@ -38,7 +38,7 @@ def test_no_profiles_need_welcome_email(caplog: pytest.LogCaptureFixture):
 @pytest.mark.django_db
 def test_no_locale_defaults_to_en(
     mock_ses_client: MagicMock, caplog: pytest.LogCaptureFixture
-):
+) -> None:
     ftl_bundle.reload()
     user = _make_user_who_needs_welcome_email_with_locale("")
 
@@ -58,7 +58,7 @@ def test_no_locale_defaults_to_en(
 @pytest.mark.parametrize("locale", ("en-US,en;q=0.5", "de;q=0.7,en;q=0.3"))
 def test_send_welcome_emails(
     locale: str, mock_ses_client: MagicMock, caplog: pytest.LogCaptureFixture
-):
+) -> None:
     ftl_bundle.reload()
     user = _make_user_who_needs_welcome_email_with_locale(locale)
 
@@ -75,7 +75,7 @@ def test_send_welcome_emails(
     assert expected_cta in body_html
 
 
-def client_error_on_invalid_email(*args, **kwargs):
+def client_error_on_invalid_email(*args: Any, **kwargs: Any) -> None:
     for address in kwargs["Destination"]["ToAddresses"]:
         if "±×÷√" in address:
             raise ClientError(
@@ -105,7 +105,7 @@ def test_invalid_email_address_skips_invalid(
     call_command(COMMAND_NAME)
 
     invalid_email_user.profile.refresh_from_db()
-    assert invalid_email_user.profile.sent_welcome_email == False
+    assert invalid_email_user.profile.sent_welcome_email is False
 
     rec1, rec2, rec3, rec4, rec5 = caplog.records
     assert "Starting" in rec1.getMessage()
@@ -143,7 +143,7 @@ def _assert_caplog_for_1_email_to_user(
     assert "Exiting" in rec4.getMessage()
 
 
-def _get_send_email_args(mock_ses_client: MagicMock) -> tuple:
+def _get_send_email_args(mock_ses_client: MagicMock) -> tuple[list[str], str, str, str]:
     call_args = mock_ses_client.send_email.call_args[1]
     to_addresses = call_args["Destination"]["ToAddresses"]
     source = call_args["Source"]

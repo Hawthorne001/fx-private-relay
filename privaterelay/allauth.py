@@ -1,14 +1,13 @@
-from urllib.parse import urlencode, urlparse
 import logging
+from urllib.parse import urlencode, urlparse
 
 from django.http import Http404
-from django.shortcuts import resolve_url
+from django.shortcuts import redirect, resolve_url
 from django.urls import resolve
 
 from allauth.account.adapter import DefaultAccountAdapter
 
 from .middleware import RelayStaticFilesMiddleware
-
 
 logger = logging.getLogger("events")
 
@@ -18,7 +17,10 @@ class AccountAdapter(DefaultAccountAdapter):
         """
         Redirect to dashboard, preserving utm params from FXA.
         """
-        assert request.user.is_authenticated
+        if not request.user.is_authenticated:
+            raise ValueError(
+                "request.user must be authenticated when calling get_login_redirect_url"
+            )
         url = "/accounts/profile/?"
         utm_params = {k: v for k, v in request.GET.items() if k.startswith("utm")}
         url += urlencode(utm_params)
@@ -41,7 +43,7 @@ class AccountAdapter(DefaultAccountAdapter):
         # Is this a known frontend path?
         try:
             middleware = RelayStaticFilesMiddleware()
-        except Exception:
+        except Exception:  # noqa: S110 (exception pass without log)
             # Staticfiles are not available
             pass
         else:
@@ -52,3 +54,6 @@ class AccountAdapter(DefaultAccountAdapter):
         # The path is invalid
         logger.error("No matching URL for '%s'", url)
         return False
+
+    def respond_user_inactive(self, request, user):
+        return redirect("/accounts/account_inactive/")

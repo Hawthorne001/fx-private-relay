@@ -1,28 +1,19 @@
-from collections import defaultdict
-from copy import deepcopy
-from datetime import datetime, timezone
+import html
+import json
+import logging
+import re
+import shlex
+from datetime import UTC, datetime
 from email import message_from_bytes
 from email.iterators import _structure
 from email.message import EmailMessage
 from email.utils import parseaddr
-import html
 from io import StringIO
-import json
 from json import JSONDecodeError
-import logging
-import re
-import shlex
 from textwrap import dedent
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple, TypedDict, TypeVar
 from urllib.parse import urlencode
-
-from botocore.exceptions import ClientError
-from codetiming import Timer
-from decouple import strtobool
-from django.shortcuts import render
-from sentry_sdk import capture_message
-from markus.utils import generate_tag
-from waffle import sample_is_active
+from uuid import uuid4
 
 from django.conf import settings
 from django.contrib.auth.models import User
@@ -30,37 +21,52 @@ from django.core.exceptions import ObjectDoesNotExist
 from django.db import transaction
 from django.db.models import prefetch_related_objects
 from django.http import HttpRequest, HttpResponse
+from django.shortcuts import render
 from django.template.loader import render_to_string
 from django.utils.html import escape
 from django.views.decorators.csrf import csrf_exempt
 
-from privaterelay.utils import get_subplat_upgrade_link_by_language, glean_logger
+from botocore.exceptions import ClientError
+from codetiming import Timer
+from decouple import strtobool
+from markus.utils import generate_tag
+from sentry_sdk import capture_message
+from waffle import get_waffle_flag_model, sample_is_active
 
+from privaterelay.ftl_bundles import main as ftl_bundle
+from privaterelay.models import Profile
+from privaterelay.utils import (
+    flag_is_active_in_task,
+    get_subplat_upgrade_link_by_language,
+    glean_logger,
+)
 
+from .exceptions import CannotMakeAddressException
 from .models import (
-    CannotMakeAddressException,
     DeletedAddress,
     DomainAddress,
-    Profile,
     RelayAddress,
     Reply,
     address_hash,
     get_domain_numerical,
 )
 from .policy import relay_policy
+from .sns import SUPPORTED_SNS_TYPES, verify_from_sns
 from .types import (
     AWS_MailJSON,
     AWS_SNSMessageJSON,
-    OutgoingHeaders,
     EmailForwardingIssues,
     EmailHeaderIssues,
+    OutgoingHeaders,
 )
 from .utils import (
+    InvalidFromHeader,
     _get_bucket_and_key_from_s3_json,
     b64_lookup_key,
     count_all_trackers,
     decrypt_reply_metadata,
     derive_reply_keys,
+    encode_dict_gza85,
     encrypt_reply_metadata,
     generate_from_header,
     get_domains_from_settings,
@@ -69,17 +75,12 @@ from .utils import (
     get_reply_to_address,
     histogram_if_enabled,
     incr_if_enabled,
+    parse_email_header,
     remove_message_from_s3,
     remove_trackers,
     ses_send_raw_email,
     urlize_and_linebreaks,
-    InvalidFromHeader,
-    parse_email_header,
 )
-from .sns import verify_from_sns, SUPPORTED_SNS_TYPES
-
-from privaterelay.ftl_bundles import main as ftl_bundle
-from privaterelay.utils import flag_is_active_in_task
 
 logger = logging.getLogger("events")
 info_logger = logging.getLogger("eventsinfo")
@@ -137,6 +138,32 @@ def reply_requires_premium_test(request):
                 "text/plain; charset=utf-8",
             )
     return render(request, "emails/reply_requires_premium.html", email_context)
+
+
+def disabled_mask_for_spam_test(request):
+    """
+    Demonstrate rendering of the "Disabled mask for spam" email.
+
+    Settings like language can be given in the querystring, otherwise settings
+    come from a random free profile.
+    """
+    mask = "abc123456@mozmail.com"
+    email_context = {
+        "mask": mask,
+        "SITE_ORIGIN": settings.SITE_ORIGIN,
+    }
+    for param in request.GET:
+        email_context[param] = request.GET.get(param)
+
+    for param in request.GET:
+        if param == "content-type" and request.GET[param] == "text/plain":
+            return render(
+                request,
+                "emails/disabled_mask_for_spam.txt",
+                email_context,
+                "text/plain; charset=utf-8",
+            )
+    return render(request, "emails/disabled_mask_for_spam.html", email_context)
 
 
 def first_forwarded_email_test(request: HttpRequest) -> HttpResponse:
@@ -201,13 +228,15 @@ def wrapped_email_test(request: HttpRequest) -> HttpResponse:
     if "language" in request.GET:
         language = request.GET["language"]
     else:
-        assert user_profile is not None
+        if user_profile is None:
+            raise ValueError("user_profile must not be None")
         language = user_profile.language
 
     if "has_premium" in request.GET:
         has_premium = strtobool(request.GET["has_premium"])
     else:
-        assert user_profile is not None
+        if user_profile is None:
+            raise ValueError("user_profile must not be None")
         has_premium = user_profile.has_premium
 
     if "num_level_one_email_trackers_removed" in request.GET:
@@ -334,7 +363,8 @@ def _store_reply_record(
     if isinstance(address, DomainAddress):
         reply_create_args["domain_address"] = address
     else:
-        assert isinstance(address, RelayAddress)
+        if not isinstance(address, RelayAddress):
+            raise TypeError("address must be type RelayAddress")
         reply_create_args["relay_address"] = address
     Reply.objects.create(**reply_create_args)
     return mail
@@ -442,8 +472,10 @@ def _sns_notification(json_body):
             },
         )
         return HttpResponse(
-            "Received SNS notification for unsupported Type: %s"
-            % html.escape(shlex.quote(notification_type)),
+            (
+                "Received SNS notification for unsupported Type: "
+                f"{html.escape(shlex.quote(notification_type))}"
+            ),
             status=400,
         )
     response = _sns_message(message_json)
@@ -467,7 +499,7 @@ def _get_relay_recipient_from_message_json(message_json):
     # Go thru all To, Cc, and Bcc fields and
     # return the one that has a Relay domain
 
-    # First check commmon headers for to or cc match
+    # First check common headers for to or cc match
     headers_to_check = "to", "cc"
     common_headers = message_json["mail"]["commonHeaders"]
     for header in headers_to_check:
@@ -483,13 +515,17 @@ def _get_relay_recipient_from_message_json(message_json):
 
 def _sns_message(message_json: AWS_SNSMessageJSON) -> HttpResponse:
     incr_if_enabled("sns_inbound_Notification_Received", 1)
+    init_waffle_flags()
     notification_type = message_json.get("notificationType")
     event_type = message_json.get("eventType")
     if notification_type == "Bounce" or event_type == "Bounce":
         return _handle_bounce(message_json)
     if notification_type == "Complaint" or event_type == "Complaint":
         return _handle_complaint(message_json)
-    assert notification_type == "Received" and event_type is None
+    if notification_type != "Received":
+        raise ValueError('notification_type must be "Received"')
+    if event_type is not None:
+        raise ValueError("event_type must be None")
     return _handle_received(message_json)
 
 
@@ -503,6 +539,7 @@ EmailDroppedReason = Literal[
     "hard_bounce_pause",  # The user recently had a hard bounce
     "soft_bounce_pause",  # The user recently has a soft bounce
     "abuse_flag",  # The user exceeded an abuse limit, like mails forwarded
+    "user_deactivated",  # The user account is deactivated
     "reply_requires_premium",  # The email is a reply from a free user
     "content_missing",  # Could not load the email from storage
     "error_from_header",  # Error generating the From: header, retryable
@@ -640,7 +677,7 @@ def _handle_received(message_json: AWS_SNSMessageJSON) -> HttpResponse:
     bounce_paused, bounce_type = user_profile.check_bounce_pause()
     if bounce_paused:
         _record_receipt_verdicts(receipt, "user_bounce_paused")
-        incr_if_enabled("email_suppressed_for_%s_bounce" % bounce_type, 1)
+        incr_if_enabled(f"email_suppressed_for_{bounce_type}_bounce", 1)
         reason: Literal["soft_bounce_pause", "hard_bounce_pause"] = (
             "soft_bounce_pause" if bounce_type == "soft" else "hard_bounce_pause"
         )
@@ -669,13 +706,17 @@ def _handle_received(message_json: AWS_SNSMessageJSON) -> HttpResponse:
         log_email_dropped(reason="abuse_flag", mask=address)
         return HttpResponse("Address is temporarily disabled.")
 
+    if not user_profile.user.is_active:
+        log_email_dropped(reason="user_deactivated", mask=address)
+        return HttpResponse("Account is deactivated.")
+
     # if address is set to block, early return
     if not address.enabled:
         incr_if_enabled("email_for_disabled_address", 1)
         address.num_blocked += 1
         address.save(update_fields=["num_blocked"])
         _record_receipt_verdicts(receipt, "disabled_alias")
-        user_profile.last_engagement = datetime.now(timezone.utc)
+        user_profile.last_engagement = datetime.now(UTC)
         user_profile.save()
         glean_logger().log_email_blocked(mask=address, reason="block_all")
         return HttpResponse("Address is temporarily disabled.")
@@ -693,7 +734,7 @@ def _handle_received(message_json: AWS_SNSMessageJSON) -> HttpResponse:
         incr_if_enabled("list_email_for_address_blocking_lists", 1)
         address.num_blocked += 1
         address.save(update_fields=["num_blocked"])
-        user_profile.last_engagement = datetime.now(timezone.utc)
+        user_profile.last_engagement = datetime.now(UTC)
         user_profile.save()
         glean_logger().log_email_blocked(mask=address, reason="block_promotional")
         return HttpResponse("Address is not accepting list emails.")
@@ -722,14 +763,6 @@ def _handle_received(message_json: AWS_SNSMessageJSON) -> HttpResponse:
         log_email_dropped(reason="error_from_header", mask=address, can_retry=True)
         return HttpResponse("Cannot parse the From address", status=503)
 
-    headers: OutgoingHeaders = {
-        "Subject": subject,
-        "From": from_header,
-        "To": destination_address,
-        "Reply-To": reply_address,
-        "Resent-From": from_address,
-    }
-
     # Get incoming email
     try:
         (incoming_email_bytes, transport, load_time_s) = _get_email_bytes(message_json)
@@ -743,7 +776,23 @@ def _handle_received(message_json: AWS_SNSMessageJSON) -> HttpResponse:
         # we are returning a 503 so that SNS can retry the email processing
         return HttpResponse("Cannot fetch the message content from S3", status=503)
 
+    # Handle developer overrides, logging
+    dev_action = _get_developer_mode_action(address)
+    if dev_action:
+        if dev_action.new_destination_address:
+            destination_address = dev_action.new_destination_address
+        _log_dev_notification(
+            "_handle_received: developer_mode", dev_action, message_json
+        )
+
     # Convert to new email
+    headers: OutgoingHeaders = {
+        "Subject": subject,
+        "From": from_header,
+        "To": destination_address,
+        "Reply-To": reply_address,
+        "Resent-From": from_address,
+    }
     sample_trackers = bool(sample_is_active("tracker_sample"))
     tracker_removal_flag = flag_is_active_in_task("tracker_removal", address.user)
     remove_level_one_trackers = bool(
@@ -770,7 +819,7 @@ def _handle_received(message_json: AWS_SNSMessageJSON) -> HttpResponse:
     if has_text:
         incr_if_enabled("email_with_text_content", 1)
     if issues:
-        info_logger.warning(
+        info_logger.info(
             "_handle_received: forwarding issues", extra={"issues": issues}
         )
 
@@ -782,7 +831,7 @@ def _handle_received(message_json: AWS_SNSMessageJSON) -> HttpResponse:
             message=forwarded_email,
         )
     except ClientError:
-        # 503 service unavailable reponse to SNS so it can retry
+        # 503 service unavailable response to SNS so it can retry
         log_email_dropped(reason="error_sending", mask=address, can_retry=True)
         return HttpResponse("SES client error on Raw Email", status=503)
 
@@ -792,10 +841,10 @@ def _handle_received(message_json: AWS_SNSMessageJSON) -> HttpResponse:
     user_profile.update_abuse_metric(
         email_forwarded=True, forwarded_email_size=len(incoming_email_bytes)
     )
-    user_profile.last_engagement = datetime.now(timezone.utc)
+    user_profile.last_engagement = datetime.now(UTC)
     user_profile.save()
     address.num_forwarded += 1
-    address.last_used_at = datetime.now(timezone.utc)
+    address.last_used_at = datetime.now(UTC)
     if level_one_trackers_removed:
         address.num_level_one_trackers_blocked = (
             address.num_level_one_trackers_blocked or 0
@@ -812,8 +861,14 @@ def _handle_received(message_json: AWS_SNSMessageJSON) -> HttpResponse:
     return HttpResponse("Sent email to final recipient.", status=200)
 
 
+class DeveloperModeAction(NamedTuple):
+    mask_id: str
+    action: Literal["log", "simulate_complaint"] = "log"
+    new_destination_address: str | None = None
+
+
 def _get_verdict(receipt, verdict_type):
-    return receipt["%sVerdict" % verdict_type]["status"]
+    return receipt[f"{verdict_type}Verdict"]["status"]
 
 
 def _check_email_from_list(headers):
@@ -900,6 +955,59 @@ def _get_email_bytes(
     return (message_content, transport, load_time_s)
 
 
+def _get_developer_mode_action(
+    mask: RelayAddress | DomainAddress,
+) -> DeveloperModeAction | None:
+    """Get the developer mode actions for this mask, if enabled."""
+
+    if not (
+        flag_is_active_in_task("developer_mode", mask.user)
+        and "DEV:" in mask.description
+    ):
+        return None
+
+    if "DEV:simulate_complaint" in mask.description:
+        action = DeveloperModeAction(
+            mask_id=mask.metrics_id,
+            action="simulate_complaint",
+            new_destination_address=f"complaint+{mask.metrics_id}@simulator.amazonses.com",
+        )
+    else:
+        action = DeveloperModeAction(mask_id=mask.metrics_id, action="log")
+    return action
+
+
+def _log_dev_notification(
+    log_message: str, dev_action: DeveloperModeAction, notification: dict[str, Any]
+) -> None:
+    """
+    Log notification JSON
+
+    This will log information beyond our privacy policy, so it should only be used on
+    Relay staff accounts with prior permission.
+
+    The notification JSON will be compressed, Ascii85-encoded with padding, and broken
+    into 1024-bytes chunks. This will ensure it fits into GCP's log entry, which has a
+    64KB limit per label value.
+    """
+
+    notification_gza85 = encode_dict_gza85(notification)
+    total_parts = notification_gza85.count("\n") + 1
+    log_group_id = str(uuid4())
+    for partnum, part in enumerate(notification_gza85.splitlines()):
+        info_logger.info(
+            log_message,
+            extra={
+                "mask_id": dev_action.mask_id,
+                "dev_action": dev_action.action,
+                "log_group_id": log_group_id,
+                "part": partnum,
+                "parts": total_parts,
+                "notification_gza85": part,
+            },
+        )
+
+
 def _convert_to_forwarded_email(
     incoming_email_bytes: bytes,
     headers: OutgoingHeaders,
@@ -925,7 +1033,8 @@ def _convert_to_forwarded_email(
     # python/typeshed issue 2418
     # The Python 3.2 default was Message, 3.6 uses policy.message_factory, and
     # policy.default.message_factory is EmailMessage
-    assert isinstance(email, EmailMessage)
+    if not isinstance(email, EmailMessage):
+        raise TypeError("email must be type EmailMessage")
 
     # Replace headers in the original email
     header_issues = _replace_headers(email, headers)
@@ -936,7 +1045,8 @@ def _convert_to_forwarded_email(
     has_text = False
     if text_body:
         has_text = True
-        assert isinstance(text_body, EmailMessage)
+        if not isinstance(text_body, EmailMessage):
+            raise TypeError("text_body must be type EmailMessage")
         text_content = text_body.get_content()
         new_text_content = _convert_text_content(text_content, to_address)
         text_body.set_content(new_text_content)
@@ -947,7 +1057,8 @@ def _convert_to_forwarded_email(
     has_html = False
     if html_body:
         has_html = True
-        assert isinstance(html_body, EmailMessage)
+        if not isinstance(html_body, EmailMessage):
+            raise TypeError("html_body must be type EmailMessage")
         html_content = html_body.get_content()
         new_content, level_one_trackers_removed = _convert_html_content(
             html_content,
@@ -971,7 +1082,8 @@ def _convert_to_forwarded_email(
             sample_trackers,
             remove_level_one_trackers,
         )
-        assert isinstance(text_body, EmailMessage)
+        if not isinstance(text_body, EmailMessage):
+            raise TypeError("text_body must be type EmailMessage")
         try:
             text_body.add_alternative(new_content, subtype="html")
         except TypeError as e:
@@ -1008,25 +1120,36 @@ def _replace_headers(
     # Look for headers to drop
     to_drop: list[str] = []
     replacements: set[str] = {_k.lower() for _k in headers.keys()}
-    issues: EmailHeaderIssues = defaultdict(list)
+    issues: EmailHeaderIssues = []
 
     # Detect non-compliant headers in incoming emails
     for header in email.keys():
         try:
             value = email[header]
         except Exception as e:
-            issues["incoming"].append((header, {"exception_on_read": repr(e)}))
+            issues.append(
+                {"header": header, "direction": "in", "exception_on_read": repr(e)}
+            )
             value = None
         if getattr(value, "defects", None):
-            issues["incoming"].append(
-                (
-                    header,
-                    {
-                        "defect_count": len(value.defects),
-                        "parsed_value": str(value),
-                        "unstructured_value": str(value.as_unstructured),
-                    },
-                )
+            issues.append(
+                {
+                    "header": header,
+                    "direction": "in",
+                    "defect_count": len(value.defects),
+                    "parsed_value": str(value),
+                    "raw_value": str(value.as_raw),
+                }
+            )
+        elif getattr(getattr(value, "_parse_tree", None), "all_defects", []):
+            issues.append(
+                {
+                    "header": header,
+                    "direction": "in",
+                    "defect_count": len(value._parse_tree.all_defects),
+                    "parsed_value": str(value),
+                    "raw_value": str(value.as_raw),
+                }
             )
 
     # Collect headers that will not be forwarded
@@ -1047,30 +1170,41 @@ def _replace_headers(
     for header, value in headers.items():
         del email[header]
         try:
-            email[header] = value
+            email[header] = value.rstrip("\r\n")
         except Exception as e:
-            issues["outgoing"].append(
-                (header, {"exception_on_write": repr(e), "value": value})
+            issues.append(
+                {
+                    "header": header,
+                    "direction": "out",
+                    "exception_on_write": repr(e),
+                    "value": value,
+                }
             )
             continue
         try:
             parsed_value = email[header]
         except Exception as e:
-            issues["outgoing"].append((header, {"exception_on_read": repr(e)}))
+            issues.append(
+                {
+                    "header": header,
+                    "direction": "out",
+                    "exception_on_write": repr(e),
+                    "value": value,
+                }
+            )
             continue
         if parsed_value.defects:
-            issues["outgoing"].append(
-                (
-                    header,
-                    {
-                        "defect_count": len(parsed_value.defects),
-                        "parsed_value": str(parsed_value),
-                        "unstructured_value": str(parsed_value.as_unstructured),
-                    },
-                )
+            issues.append(
+                {
+                    "header": header,
+                    "direction": "out",
+                    "defect_count": len(parsed_value.defects),
+                    "parsed_value": str(parsed_value),
+                    "raw_value": str(parsed_value.as_raw),
+                },
             )
 
-    return dict(issues)
+    return issues
 
 
 def _convert_html_content(
@@ -1084,7 +1218,7 @@ def _convert_html_content(
     now: datetime | None = None,
 ) -> tuple[str, int]:
     # frontend expects a timestamp in milliseconds
-    now = now or datetime.now(timezone.utc)
+    now = now or datetime.now(UTC)
     datetime_now_ms = int(now.timestamp() * 1000)
 
     # scramble alias so that clients don't recognize it
@@ -1205,6 +1339,9 @@ def _reply_allowed(
     ):
         # This is a Relay user replying to an external sender;
 
+        if not reply_record.profile.user.is_active:
+            return False
+
         if reply_record.profile.is_flagged:
             return False
 
@@ -1300,7 +1437,8 @@ def _handle_reply(
         return HttpResponse("Cannot fetch the message content from S3", status=503)
 
     email = message_from_bytes(email_bytes, policy=relay_policy)
-    assert isinstance(email, EmailMessage)
+    if not isinstance(email, EmailMessage):
+        raise TypeError("email must be type EmailMessage")
 
     # Convert to a reply email
     # TODO: Issue #1747 - Remove wrapper / prefix in replies
@@ -1319,18 +1457,20 @@ def _handle_reply(
     reply_record.increment_num_replied()
     profile = address.user.profile
     profile.update_abuse_metric(replied=True)
-    profile.last_engagement = datetime.now(timezone.utc)
+    profile.last_engagement = datetime.now(UTC)
     profile.save()
     glean_logger().log_email_forwarded(mask=address, is_reply=True)
     return HttpResponse("Sent email to final recipient.", status=200)
 
 
-def _get_domain_address(local_portion: str, domain_portion: str) -> DomainAddress:
+def _get_domain_address(
+    local_portion: str, domain_portion: str, create: bool = True
+) -> DomainAddress:
     """
     Find or create the DomainAddress for the parts of an email address.
 
-    If the domain_portion is for a valid subdomain, a new DomainAddress
-    will be created and returned.
+    If the domain_portion is for a valid subdomain, and create=True, a new DomainAddress
+    will be created and returned. If create=False, DomainAddress.DoesNotExist is raised.
 
     If the domain_portion is for an unknown domain, ObjectDoesNotExist is raised.
 
@@ -1339,7 +1479,8 @@ def _get_domain_address(local_portion: str, domain_portion: str) -> DomainAddres
 
     [address_subdomain, address_domain] = domain_portion.split(".", 1)
     if address_domain != get_domains_from_settings()["MOZMAIL_DOMAIN"]:
-        incr_if_enabled("email_for_not_supported_domain", 1)
+        if create:
+            incr_if_enabled("email_for_not_supported_domain", 1)
         raise ObjectDoesNotExist("Address does not exist")
     try:
         with transaction.atomic():
@@ -1353,34 +1494,38 @@ def _get_domain_address(local_portion: str, domain_portion: str) -> DomainAddres
                 user=locked_profile.user, address=local_portion, domain=domain_numerical
             ).first()
             if domain_address is None:
+                if not create:
+                    raise DomainAddress.DoesNotExist()
                 # TODO: Consider flows when a user generating alias on a fly
                 # was unable to receive an email due to user no longer being a
                 # premium user as seen in exception thrown on make_domain_address
                 domain_address = DomainAddress.make_domain_address(
-                    locked_profile, local_portion, True
+                    locked_profile.user, local_portion, True
                 )
                 glean_logger().log_email_mask_created(
                     mask=domain_address,
                     created_by_api=False,
                 )
-            domain_address.last_used_at = datetime.now(timezone.utc)
+            domain_address.last_used_at = datetime.now(UTC)
             domain_address.save()
             return domain_address
     except Profile.DoesNotExist as e:
-        incr_if_enabled("email_for_dne_subdomain", 1)
+        if create:
+            incr_if_enabled("email_for_dne_subdomain", 1)
         raise e
 
 
-def _get_address(address: str) -> RelayAddress | DomainAddress:
+def _get_address(address: str, create: bool = True) -> RelayAddress | DomainAddress:
     """
     Find or create the RelayAddress or DomainAddress for an email address.
 
-    If an unknown email address is for a valid subdomain, a new DomainAddress
-    will be created.
+    If an unknown email address is for a valid subdomain, and create is True,
+    a new DomainAddress will be created.
 
     On failure, raises exception based on Django's ObjectDoesNotExist:
     * RelayAddress.DoesNotExist - looks like RelayAddress, deleted or does not exist
     * Profile.DoesNotExist - looks like DomainAddress, no subdomain match
+    * DomainAddress.DoesNotExist - looks like unknown DomainAddress, create is False
     * ObjectDoesNotExist - Unknown domain
     """
 
@@ -1392,7 +1537,7 @@ def _get_address(address: str) -> RelayAddress | DomainAddress:
     # it may be for a user's subdomain
     email_domains = get_domains_from_settings().values()
     if domain not in email_domains:
-        return _get_domain_address(local_address, domain)
+        return _get_domain_address(local_address, domain, create)
 
     # the domain is the site's 'top' relay domain, so look up the RelayAddress
     try:
@@ -1402,6 +1547,8 @@ def _get_address(address: str) -> RelayAddress | DomainAddress:
         )
         return relay_address
     except RelayAddress.DoesNotExist as e:
+        if not create:
+            raise e
         try:
             DeletedAddress.objects.get(
                 address_hash=address_hash(local_address, domain=domain)
@@ -1414,6 +1561,14 @@ def _get_address(address: str) -> RelayAddress | DomainAddress:
             # not sure why this happens on stage but let's handle it
             incr_if_enabled("email_for_deleted_address_multiple", 1)
         raise e
+
+
+def _get_address_if_exists(address: str) -> RelayAddress | DomainAddress | None:
+    """Get the matching RelayAddress or DomainAddress, or None if it doesn't exist."""
+    try:
+        return _get_address(address, create=False)
+    except (RelayAddress.DoesNotExist, Profile.DoesNotExist, ObjectDoesNotExist):
+        return None
 
 
 def _handle_bounce(message_json: AWS_SNSMessageJSON) -> HttpResponse:
@@ -1439,16 +1594,14 @@ def _handle_bounce(message_json: AWS_SNSMessageJSON) -> HttpResponse:
     * bounce_diagnostic: 'diagnosticCode' from bounced recipient data, or None
     * bounce_extra: Extra data from bounce_recipient data, if any
     * domain: User's real email address domain, if an address was given
-
-    Emits a legacy log "bounced recipient domain: {domain}", with data from
-    bounced recipient data, without the email address.
+    * fxa_id - The Mozilla account (previously known as Firefox Account) ID of the user
     """
     bounce = message_json.get("bounce", {})
     bounce_type = bounce.get("bounceType", "none")
     bounce_subtype = bounce.get("bounceSubType", "none")
     bounced_recipients = bounce.get("bouncedRecipients", [])
 
-    now = datetime.now(timezone.utc)
+    now = datetime.now(UTC)
     bounce_data = []
     for recipient in bounced_recipients:
         recipient_address = recipient.pop("emailAddress", None)
@@ -1476,6 +1629,10 @@ def _handle_bounce(message_json: AWS_SNSMessageJSON) -> HttpResponse:
             user = User.objects.get(email=recipient_address)
             profile = user.profile
             data["user_match"] = "found"
+            if (fxa := profile.fxa) and profile.metrics_enabled:
+                data["fxa_id"] = fxa.uid
+            else:
+                data["fxa_id"] = ""
         except User.DoesNotExist:
             # TODO: handle bounce for a user who no longer exists
             # add to SES account-wide suppression list?
@@ -1518,29 +1675,61 @@ def _handle_bounce(message_json: AWS_SNSMessageJSON) -> HttpResponse:
         )
         info_logger.info("bounce_notification", extra=data)
 
-        # Legacy log, can be removed Q4 2023
-        recipient_domain = data.get("domain")
-        if recipient_domain:
-            legacy_extra = {
-                "action": data.get("bounce_action"),
-                "status": data.get("bounce_status"),
-                "diagnosticCode": data.get("bounce_diagnostic"),
-            }
-            legacy_extra.update(data.get("bounce_extra", {}))
-            info_logger.info(
-                f"bounced recipient domain: {recipient_domain}", extra=legacy_extra
-            )
-
     if any(data["user_match"] == "missing" for data in bounce_data):
         return HttpResponse("Address does not exist", status=404)
     return HttpResponse("OK", status=200)
+
+
+def _build_disabled_mask_for_spam_email(
+    mask: RelayAddress | DomainAddress,
+) -> EmailMessage:
+    ctx = {"mask": mask.full_address, "SITE_ORIGIN": settings.SITE_ORIGIN}
+    html_body = render_to_string("emails/disabled_mask_for_spam.html", ctx)
+    text_body = render_to_string("emails/disabled_mask_for_spam.txt", ctx)
+
+    # Create the message
+    msg = EmailMessage()
+    msg["Subject"] = ftl_bundle.format("relay-deactivated-mask-email-subject")
+    msg["From"] = settings.RELAY_FROM_ADDRESS
+    msg["To"] = mask.user.email
+    msg.set_content(text_body)
+    msg.add_alternative(html_body, subtype="html")
+    return msg
+
+
+def _send_disabled_mask_for_spam_email(mask: RelayAddress | DomainAddress) -> None:
+    msg = _build_disabled_mask_for_spam_email(mask)
+    if not settings.RELAY_FROM_ADDRESS:
+        raise ValueError(
+            "Must set settings.RELAY_FROM_ADDRESS to send disabled_mask_for_spam email."
+        )
+    try:
+        ses_send_raw_email(
+            source_address=settings.RELAY_FROM_ADDRESS,
+            destination_address=mask.user.email,
+            message=msg,
+        )
+    except ClientError as e:
+        logger.error("send_disabled_mask_ses_client_error", extra=e.response["Error"])
+    incr_if_enabled("send_disabled_mask_email", 1)
 
 
 def _handle_complaint(message_json: AWS_SNSMessageJSON) -> HttpResponse:
     """
     Handle an AWS SES complaint notification.
 
-    For more information, see:
+    This looks for Relay users in the complainedRecipients (real email address)
+    and the From: header (mask address). We expect both to match the same Relay user,
+    and return a 200. If one or the other do not match, a 404 is returned, and errors
+    may be logged.
+
+    The first time a user complains, this sets the user's auto_block_spam flag to True.
+
+    The second time a user complains, this disables the mask thru which the spam mail
+    was forwarded, and sends an email to the user to notify them the mask is disabled
+    and can be re-enabled on their dashboard.
+
+    For more information on the complaint notification, see:
     https://docs.aws.amazon.com/ses/latest/dg/notification-contents.html#complaint-object
 
     Returns:
@@ -1548,89 +1737,332 @@ def _handle_complaint(message_json: AWS_SNSMessageJSON) -> HttpResponse:
     * 200 response if all match or none are given
 
     Emits a counter metric "email_complaint" with these tags:
-    * complaint_subtype: 'onaccounsuppressionlist', or 'none' if omitted
-    * complaint_feedback - feedback enumeration from ISP or 'none'
-    * user_match: 'found', 'missing', error states 'no_address' and 'no_recipients'
-    * relay_action: 'no_action', 'auto_block_spam'
+    * complaint_subtype: 'onaccountsuppressionlist', or 'none' if omitted
+    * complaint_feedback - feedback enumeration from ISP (usually 'abuse') or 'none'
+    * user_match: 'found' or 'no_recipients'
+    * relay_action: 'no_action', 'auto_block_spam', or 'disable_mask'
 
     Emits an info log "complaint_notification", same data as metric, plus:
     * complaint_user_agent - identifies the client used to file the complaint
     * complaint_extra - Extra data from complainedRecipients data, if any
     * domain - User's domain, if an address was given
-
-    Emits a legacy log "complaint_received", with data:
-    * recipient_domains: list of extracted user domains
-    * subtype: 'onaccounsuppressionlist', or 'none'
-    * feedback: feedback from ISP or 'none'
+    * found_in - "complained_recipients" (real email), "from_header" (email mask),
+      or "all" (matching records found in both)
+    * fxa_id - The Mozilla account (previously known as Firefox Account) ID of the user
+    * mask_match - "found" if "From" header contains an email mask, or "not_found"
     """
-    complaint = deepcopy(message_json.get("complaint", {}))
-    complained_recipients = complaint.pop("complainedRecipients", [])
-    subtype = complaint.pop("complaintSubType", None)
-    user_agent = complaint.pop("userAgent", None)
-    feedback = complaint.pop("complaintFeedbackType", None)
+    complaint_data = _get_complaint_data(message_json)
+    complainers, unknown_count = _gather_complainers(complaint_data)
 
-    complaint_data = []
-    for recipient in complained_recipients:
-        recipient_address = recipient.pop("emailAddress", None)
-        data = {
-            "complaint_subtype": subtype,
-            "complaint_user_agent": user_agent,
-            "complaint_feedback": feedback,
-            "user_match": "no_address",
-            "relay_action": "no_action",
+    # Reduce future complaints from complaining Relay users
+    actions: list[ComplaintAction] = []
+    for complainer in complainers:
+        action = _reduce_future_complaints(complainer)
+        actions.append(action)
+
+        if (
+            flag_is_active_in_task("developer_mode", complainer["user"])
+            and action.mask_id
+        ):
+            _log_dev_notification(
+                "_handle_complaint: developer_mode",
+                DeveloperModeAction(mask_id=action.mask_id, action="log"),
+                message_json,
+            )
+
+    # Log complaint and actions taken
+    if not actions:
+        # Log the complaint but that no action was taken
+        actions.append(ComplaintAction(user_match="no_recipients"))
+    for action in actions:
+        tags = [
+            generate_tag(key, val)
+            for key, val in {
+                "complaint_subtype": complaint_data.subtype or "none",
+                "complaint_feedback": complaint_data.feedback_type or "none",
+                "user_match": action.user_match,
+                "relay_action": action.relay_action,
+            }.items()
+        ]
+        incr_if_enabled("email_complaint", tags=tags)
+
+        log_extra = {
+            "complaint_subtype": complaint_data.subtype or None,
+            "complaint_user_agent": complaint_data.user_agent or None,
+            "complaint_feedback": complaint_data.feedback_type or None,
         }
-        if recipient:
-            data["complaint_extra"] = recipient.copy()
-        complaint_data.append(data)
-
-        if recipient_address is None:
-            continue
-
-        recipient_address = parseaddr(recipient_address)[1]
-        recipient_domain = recipient_address.split("@")[1]
-        data["domain"] = recipient_domain
-
-        try:
-            user = User.objects.get(email=recipient_address)
-            profile = user.profile
-            data["user_match"] = "found"
-        except User.DoesNotExist:
-            data["user_match"] = "missing"
-            continue
-
-        data["relay_action"] = "auto_block_spam"
-        profile.auto_block_spam = True
-        profile.save()
-
-    if not complaint_data:
-        # Data when there are no identified recipients
-        complaint_data = [{"user_match": "no_recipients", "relay_action": "no_action"}]
-
-    for data in complaint_data:
-        tags = {
-            "complaint_subtype": subtype or "none",
-            "complaint_feedback": feedback or "none",
-            "user_match": data["user_match"],
-            "relay_action": data["relay_action"],
-        }
-        incr_if_enabled(
-            "email_complaint",
-            1,
-            tags=[generate_tag(key, val) for key, val in tags.items()],
+        log_extra.update(
+            {
+                key: value
+                for key, value in action._asdict().items()
+                if (value is not None and key != "mask_id")
+            }
         )
-        info_logger.info("complaint_notification", extra=data)
+        info_logger.info("complaint_notification", extra=log_extra)
 
-    # Legacy log, can be removed Q4 2023
-    domains = [data["domain"] for data in complaint_data if "domain" in data]
-    info_logger.info(
-        "complaint_received",
-        extra={
-            "recipient_domains": sorted(domains),
-            "subtype": subtype,
-            "feedback": feedback,
-        },
-    )
-
-    if any(data["user_match"] == "missing" for data in complaint_data):
+    if unknown_count:
         return HttpResponse("Address does not exist", status=404)
     return HttpResponse("OK", status=200)
+
+
+class RawComplaintData(NamedTuple):
+    complained_recipients: list[tuple[str, dict[str, Any]]]
+    from_addresses: list[str]
+    subtype: str
+    user_agent: str
+    feedback_type: str
+
+
+def _get_complaint_data(message_json: AWS_SNSMessageJSON) -> RawComplaintData:
+    """
+    Extract complaint data from an AWS SES Complaint Notification.
+
+    This extracts only the data used by _handle_complaint(). It also works on
+    complaint events, which have a similar structure and the same data needed
+    by _handle_complaint.
+
+    For more information on the complaint notification, see:
+    https://docs.aws.amazon.com/ses/latest/dg/notification-contents.html#complaint-object
+    """
+    complaint = message_json["complaint"]
+
+    T = TypeVar("T")
+
+    def get_or_log(
+        key: str, source: dict[str, T], data_type: type[T]
+    ) -> tuple[T, bool]:
+        """Get a value from a dictionary, or log if not found"""
+        if key in source:
+            return source[key], True
+        logger.error(
+            "_get_complaint_data: Unexpected message format",
+            extra={"missing_key": key, "found_keys": ",".join(sorted(source.keys()))},
+        )
+        return data_type(), False
+
+    raw_recipients, has_cr = get_or_log("complainedRecipients", complaint, list)
+    complained_recipients = []
+    no_entries = True
+    for entry in raw_recipients:
+        no_entries = False
+        raw_email_address, has_email = get_or_log("emailAddress", entry, str)
+        if has_email:
+            email_address = parseaddr(raw_email_address)[1]
+            extra = {
+                key: value for key, value in entry.items() if key != "emailAddress"
+            }
+            complained_recipients.append((email_address, extra))
+    if has_cr and no_entries:
+        logger.error("_get_complaint_data: Empty complainedRecipients")
+
+    mail, has_mail = get_or_log("mail", message_json, dict)
+    if has_mail:
+        commonHeaders, has_ch = get_or_log("commonHeaders", mail, dict)
+    else:
+        commonHeaders, has_ch = {}, False
+    if has_ch:
+        raw_from_addresses, _ = get_or_log("from", commonHeaders, list)
+    else:
+        raw_from_addresses = []
+    from_addresses = [parseaddr(addr)[1] for addr in raw_from_addresses]
+
+    # Only present when set
+    feedback_type = complaint.get("complaintFeedbackType", "")
+    # Only present when destination is on account suppression list
+    subtype = complaint.get("complaintSubType", "")
+    # Only present for feedback reports
+    user_agent = complaint.get("userAgent", "")
+
+    return RawComplaintData(
+        complained_recipients, from_addresses, subtype, user_agent, feedback_type
+    )
+
+
+class Complainer(TypedDict):
+    user: User
+    found_in: Literal["complained_recipients", "from_header", "all"]
+    domain: str
+    extra: dict[str, Any] | None
+    masks: list[RelayAddress | DomainAddress]
+
+
+def _gather_complainers(
+    complaint_data: RawComplaintData,
+) -> tuple[list[Complainer], int]:
+    """
+    Fetch Relay Users and masks from the complaint data.
+
+    This matches data from an AWS SES Complaint Notification (as extracted by
+    _get_complaint_data()) to the Relay database, and returns the Users,
+    RelayAddresses, and DomainAddresses, as well as status and extra data.
+
+    If the complaint came from the AWS SES complaint simulator, detect
+    developer_mode and move forward with the developer's User data.
+    """
+
+    users: dict[int, Complainer] = {}
+    unknown_complainer_count = 0
+    for email_address, extra_data in complaint_data.complained_recipients:
+        local, domain = email_address.split("@", 1)
+
+        # If the complainer is the AWS SES complaint simulation, assume that
+        # it was send by a user with the developer_mode flag. Look for
+        # a mask that matches the embedded mask metrics_id, and use
+        # the related user's email instead of the AWS simulator address.
+        # See docs/developer_mode.md
+        if domain == "simulator.amazonses.com" and local.startswith("complaint+"):
+            mask_metrics_id = local.removeprefix("complaint+")
+            mask = _get_mask_by_metrics_id(mask_metrics_id)
+            if mask:
+                email_address = mask.user.email
+                domain = mask.user.email.split("@")[1]
+
+        try:
+            user = User.objects.get(email=email_address)
+        except User.DoesNotExist:
+            logger.error("_gather_complainers: unknown complainedRecipient")
+            unknown_complainer_count += 1
+            continue
+
+        if user.id in users:
+            logger.error("_gather_complainers: complainer appears twice")
+            continue
+
+        users[user.id] = {
+            "user": user,
+            "found_in": "complained_recipients",
+            "domain": domain,
+            "extra": extra_data or None,
+            "masks": [],
+        }
+
+    # Collect From: addresses and their users
+    unknown_sender_count = 0
+    for email_address in complaint_data.from_addresses:
+        mask = _get_address_if_exists(email_address)
+        if not mask:
+            logger.error("_gather_complainers: unknown mask, maybe deleted?")
+            unknown_sender_count += 1
+            continue
+
+        if mask.user.id not in users:
+            # Add mask-only entry to users
+            users[mask.user.id] = {
+                "user": mask.user,
+                "found_in": "from_header",
+                "domain": mask.user.email.split("@")[1],
+                "extra": None,
+                "masks": [mask],
+            }
+            continue
+
+        user_data = users[mask.user.id]
+        if mask in user_data["masks"]:
+            logger.error("_gather_complainers: mask appears twice")
+            continue
+
+        user_data["masks"].append(mask)
+        if user_data["found_in"] in ("all", "complained_recipients"):
+            user_data["found_in"] = "all"
+        else:
+            logger.error("_gather_complainers: no complainer, multi-mask")
+
+    return (list(users.values()), unknown_complainer_count + unknown_sender_count)
+
+
+def _get_mask_by_metrics_id(metrics_id: str) -> RelayAddress | DomainAddress | None:
+    """Look up a mask by metrics ID, or None if not found."""
+    if not metrics_id or metrics_id[0] not in ("R", "D"):
+        return None
+    mask_type_id = metrics_id[0]
+    mask_raw_id = metrics_id[1:]
+    try:
+        mask_id = int(mask_raw_id)
+    except ValueError:
+        return None  # ID is not an int, do not try to match to Relay mask
+
+    if mask_type_id == "R":
+        try:
+            return RelayAddress.objects.get(id=mask_id)
+        except RelayAddress.DoesNotExist:
+            return None
+    try:
+        return DomainAddress.objects.get(id=mask_id)
+    except DomainAddress.DoesNotExist:
+        return None
+
+
+class ComplaintAction(NamedTuple):
+    user_match: Literal["found", "no_recipients"]
+    relay_action: Literal["no_action", "auto_block_spam", "disable_mask"] = "no_action"
+    mask_match: Literal["found", "not_found"] = "not_found"
+    mask_id: str | None = None
+    found_in: Literal["complained_recipients", "from_header", "all"] | None = None
+    fxa_id: str | None = None
+    domain: str | None = None
+    complaint_extra: str | None = None
+
+
+def _reduce_future_complaints(complainer: Complainer) -> ComplaintAction:
+    """Take action to reduce future complaints from complaining user."""
+
+    user = complainer["user"]
+    mask_match: Literal["found", "not_found"] = "not_found"
+    relay_action: Literal["no_action", "auto_block_spam", "disable_mask"] = "no_action"
+    mask_id = None
+
+    if not user.profile.auto_block_spam:
+        relay_action = "auto_block_spam"
+        user.profile.auto_block_spam = True
+        user.profile.save()
+
+    for mask in complainer["masks"]:
+        mask_match = "found"
+        mask_id = mask.metrics_id
+        if (
+            flag_is_active_in_task("disable_mask_on_complaint", user)
+            and mask.enabled
+            and relay_action != "auto_block_spam"
+        ):
+            relay_action = "disable_mask"
+            mask.enabled = False
+            mask.save()
+            _send_disabled_mask_for_spam_email(mask)
+
+    return ComplaintAction(
+        user_match="found",
+        relay_action=relay_action,
+        mask_match=mask_match,
+        mask_id=mask_id,
+        fxa_id=user.profile.metrics_fxa_id,
+        domain=complainer["domain"],
+        found_in=complainer["found_in"],
+        complaint_extra=(
+            json.dumps(complainer["extra"]) if complainer["extra"] else None
+        ),
+    )
+
+
+_WAFFLE_FLAGS_INITIALIZED = False
+
+
+def init_waffle_flags() -> None:
+    """Initialize waffle flags for email tasks"""
+    global _WAFFLE_FLAGS_INITIALIZED
+    if _WAFFLE_FLAGS_INITIALIZED:
+        return
+
+    flags: list[tuple[str, str]] = [
+        (
+            "disable_mask_on_complaint",
+            "MPP-3119: When a Relay user marks an email as spam, disable the mask.",
+        ),
+        (
+            "developer_mode",
+            "MPP-3932: Enable logging and overrides for Relay developers.",
+        ),
+    ]
+    waffle_flag_table = get_waffle_flag_model().objects
+    for name, note in flags:
+        waffle_flag_table.get_or_create(name=name, defaults={"note": note})
+    _WAFFLE_FLAGS_INITIALIZED = True

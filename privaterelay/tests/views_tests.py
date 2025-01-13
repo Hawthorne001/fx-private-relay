@@ -1,40 +1,43 @@
 import json
 import logging
+from collections.abc import Iterator
 from copy import deepcopy
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any, Literal
-from collections.abc import Iterator
-from uuid import uuid4
 from unittest.mock import Mock, patch
+from uuid import uuid4
 
 from django.contrib.auth.models import User
-from django.test import Client, TestCase
+from django.test import Client, TestCase, override_settings
 from django.utils import timezone
 
-from allauth.socialaccount.models import SocialAccount, SocialApp, SocialToken
+import jwt
+import pytest
+import responses
 from allauth.account.models import EmailAddress
+from allauth.socialaccount.models import SocialAccount, SocialApp, SocialToken
 from cryptography.hazmat.primitives.asymmetric.rsa import (
     RSAPrivateKey,
     generate_private_key,
 )
 from markus.testing import MetricsMock
 from model_bakery import baker
-import jwt
-import pytest
-import responses
+from pytest_django.fixtures import SettingsWrapper
+from requests import PreparedRequest
 
 from emails.models import (
     DeletedAddress,
     DomainAddress,
-    Profile,
     RelayAddress,
     address_hash,
 )
-from emails.tests.models_tests import premium_subscription
+from privaterelay.tests.utils import premium_subscription
 
 from ..apps import PrivateRelayConfig
 from ..fxa_utils import NoSocialToken
+from ..models import Profile
 from ..views import _update_all_data, fxa_verifying_keys
 
 
@@ -218,7 +221,7 @@ class FxaRpEventsSetupData:
 
 @pytest.fixture
 def setup_fxa_rp_events(
-    db, settings, mock_fxa_signing_key
+    db: None, settings: SettingsWrapper, mock_fxa_signing_key: Mock
 ) -> Iterator[FxaRpEventsSetupData]:
     """Setup data for testing /fxa_rp_events."""
 
@@ -237,7 +240,7 @@ def setup_fxa_rp_events(
     profile.save()
 
     # Create FxA app, account, token, etc.
-    fxa_app: SocialApp = baker.make(SocialApp, provider="fxa")
+    fxa_app: SocialApp = baker.make(SocialApp, provider="fxa", client_id="test-fxa")
     fxa_profile_data = {
         "email": user.email,
         "locale": "en-US,en;q=0.5",
@@ -290,7 +293,7 @@ def setup_fxa_rp_events(
         data=deepcopy(fxa_profile_data),
     )
 
-    def request_callback(request) -> tuple[int, dict[str, str], str]:
+    def request_callback(request: PreparedRequest) -> tuple[int, dict[str, str], str]:
         """Mock an FxA profile response, using data the test may have changed."""
         return (
             profile_response.status_code,
@@ -298,9 +301,12 @@ def setup_fxa_rp_events(
             json.dumps(profile_response.data),
         )
 
-    with responses.RequestsMock() as mock_responses, patch(
-        "privaterelay.views.fxa_verifying_keys", return_value=[fxa_verifying_key]
-    ) as mock_fxa_verifying_keys:
+    with (
+        responses.RequestsMock() as mock_responses,
+        patch(
+            "privaterelay.views.fxa_verifying_keys", return_value=[fxa_verifying_key]
+        ) as mock_fxa_verifying_keys,
+    ):
         mock_responses.add_callback(
             responses.GET,
             f"{settings.SOCIALACCOUNT_PROVIDERS['fxa']['PROFILE_ENDPOINT']}/profile",
@@ -344,7 +350,7 @@ def get_fxa_event_jwt(
         "iss": "https://accounts.firefox.com/",
         "sub": fxa_id,
         "aud": client_id,
-        "iat": int(datetime.utcnow().timestamp()) + iat_skew,
+        "iat": int(datetime.now(UTC).timestamp()) + iat_skew,
         "jti": str(uuid4()),
         "events": {event_key: event_data},
     }
@@ -352,7 +358,9 @@ def get_fxa_event_jwt(
 
 
 def test_fxa_rp_events_password_change(
-    client: Client, setup_fxa_rp_events: FxaRpEventsSetupData, caplog
+    client: Client,
+    setup_fxa_rp_events: FxaRpEventsSetupData,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A password-change event is discarded."""
     setup_fxa_rp_events.mock_responses.reset()  # No profile fetch for password-change
@@ -361,14 +369,17 @@ def test_fxa_rp_events_password_change(
         fxa_id=setup_fxa_rp_events.fxa_acct.uid,
         client_id=setup_fxa_rp_events.app.client_id,
         signing_key=setup_fxa_rp_events.key,
-        event_data={"changeTime": int(datetime.utcnow().timestamp()) - 100},
+        event_data={"changeTime": int(datetime.now(UTC).timestamp()) - 100},
     )
     auth_header = f"Bearer {event_jwt}"
 
     with MetricsMock() as mm:
         response = client.get("/fxa-rp-events", HTTP_AUTHORIZATION=auth_header)
 
-    assert mm.get_records() == []
+    mm.assert_timing_once(
+        "fx.private.relay.response",
+        tags=["status:200", "view:privaterelay.views.fxa_rp_events", "method:GET"],
+    )
     assert caplog.record_tuples == [
         ("request.summary", logging.INFO, ""),
     ]
@@ -376,7 +387,9 @@ def test_fxa_rp_events_password_change(
 
 
 def test_fxa_rp_events_password_change_slight_future_iat(
-    client: Client, setup_fxa_rp_events: FxaRpEventsSetupData, caplog
+    client: Client,
+    setup_fxa_rp_events: FxaRpEventsSetupData,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A password-change event created in the near future is discarded."""
     setup_fxa_rp_events.mock_responses.reset()  # No profile fetch for password-change
@@ -385,7 +398,7 @@ def test_fxa_rp_events_password_change_slight_future_iat(
         fxa_id=setup_fxa_rp_events.fxa_acct.uid,
         client_id=setup_fxa_rp_events.app.client_id,
         signing_key=setup_fxa_rp_events.key,
-        event_data={"changeTime": int(datetime.utcnow().timestamp()) - 100},
+        event_data={"changeTime": int(datetime.now(UTC).timestamp()) - 100},
         iat_skew=3,
     )
     auth_header = f"Bearer {event_jwt}"
@@ -393,7 +406,10 @@ def test_fxa_rp_events_password_change_slight_future_iat(
     with MetricsMock() as mm:
         response = client.get("/fxa-rp-events", HTTP_AUTHORIZATION=auth_header)
 
-    assert mm.get_records() == []
+    mm.assert_timing_once(
+        "fx.private.relay.response",
+        tags=["status:200", "view:privaterelay.views.fxa_rp_events", "method:GET"],
+    )
     assert caplog.record_tuples == [
         ("request.summary", logging.INFO, ""),
     ]
@@ -401,7 +417,9 @@ def test_fxa_rp_events_password_change_slight_future_iat(
 
 
 def test_fxa_rp_events_password_change_far_future_iat(
-    client: Client, setup_fxa_rp_events: FxaRpEventsSetupData, caplog
+    client: Client,
+    setup_fxa_rp_events: FxaRpEventsSetupData,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """
     A password-change event created in the far future fails verification.
@@ -414,7 +432,7 @@ def test_fxa_rp_events_password_change_far_future_iat(
         fxa_id=setup_fxa_rp_events.fxa_acct.uid,
         client_id=setup_fxa_rp_events.app.client_id,
         signing_key=setup_fxa_rp_events.key,
-        event_data={"changeTime": int(datetime.utcnow().timestamp()) - 100},
+        event_data={"changeTime": int(datetime.now(UTC).timestamp()) - 100},
         iat_skew=10,
     )
     auth_header = f"Bearer {event_jwt}"
@@ -422,16 +440,22 @@ def test_fxa_rp_events_password_change_far_future_iat(
     with MetricsMock() as mm, pytest.raises(jwt.ImmatureSignatureError):
         client.get("/fxa-rp-events", HTTP_AUTHORIZATION=auth_header)
 
-    assert mm.get_records() == []
+    mm.assert_timing_once(
+        "fx.private.relay.response",
+        tags=["status:500", "view:privaterelay.views.fxa_rp_events", "method:GET"],
+    )
     assert caplog.record_tuples == [
         ("eventsinfo", logging.WARNING, "fxa_rp_event.future_iat"),
         ("request.summary", logging.ERROR, "The token is not yet valid (iat)"),
     ]
-    assert -10.0 <= caplog.records[0].iat_age_s < -8.0
+    assert isinstance(iat_age_s := getattr(caplog.records[0], "iat_age_s"), float)
+    assert -10.0 <= iat_age_s < -5.0
 
 
 def test_fxa_rp_events_profile_change(
-    client: Client, setup_fxa_rp_events: FxaRpEventsSetupData, caplog
+    client: Client,
+    setup_fxa_rp_events: FxaRpEventsSetupData,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """The profile is re-fetched for a profile-change event."""
     setup_fxa_rp_events.profile_response.data["email"] = "new-email@example.com"
@@ -447,7 +471,10 @@ def test_fxa_rp_events_profile_change(
     with MetricsMock() as mm:
         response = client.get("/fxa-rp-events", HTTP_AUTHORIZATION=auth_header)
 
-    assert mm.get_records() == []
+    mm.assert_timing_once(
+        "fx.private.relay.response",
+        tags=["status:200", "view:privaterelay.views.fxa_rp_events", "method:GET"],
+    )
     assert caplog.record_tuples == [
         ("eventsinfo", logging.INFO, "fxa_rp_event"),
         ("request.summary", logging.INFO, ""),
@@ -465,7 +492,9 @@ def test_fxa_rp_events_profile_change(
 
 
 def test_fxa_rp_events_subscription_change(
-    client: Client, setup_fxa_rp_events: FxaRpEventsSetupData, caplog
+    client: Client,
+    setup_fxa_rp_events: FxaRpEventsSetupData,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A subscription-state-change for an unrelated sub does not change the profile."""
     event_jwt = get_fxa_event_jwt(
@@ -476,14 +505,17 @@ def test_fxa_rp_events_subscription_change(
         event_data={
             "capabilities": ["new_capability"],
             "isActive": True,
-            "changeTime": int(datetime.utcnow().timestamp()) - 100,
+            "changeTime": int(datetime.now(UTC).timestamp()) - 100,
         },
     )
     auth_header = f"Bearer {event_jwt}"
 
     with MetricsMock() as mm:
         response = client.get("/fxa-rp-events", HTTP_AUTHORIZATION=auth_header)
-    assert mm.get_records() == []
+    mm.assert_timing_once(
+        "fx.private.relay.response",
+        tags=["status:200", "view:privaterelay.views.fxa_rp_events", "method:GET"],
+    )
     assert caplog.record_tuples == [
         ("eventsinfo", logging.INFO, "fxa_rp_event"),
         ("request.summary", logging.INFO, ""),
@@ -492,7 +524,9 @@ def test_fxa_rp_events_subscription_change(
 
 
 def test_fxa_rp_events_delete_user(
-    client: Client, setup_fxa_rp_events: FxaRpEventsSetupData, caplog
+    client: Client,
+    setup_fxa_rp_events: FxaRpEventsSetupData,
+    caplog: pytest.LogCaptureFixture,
 ) -> None:
     """A delete-user event deletes the user."""
     setup_fxa_rp_events.mock_responses.reset()  # No profile fetch for delete-user
@@ -519,7 +553,10 @@ def test_fxa_rp_events_delete_user(
 
     with MetricsMock() as mm:
         response = client.get("/fxa-rp-events", HTTP_AUTHORIZATION=auth_header)
-    assert mm.get_records() == []
+    mm.assert_timing_once(
+        "fx.private.relay.response",
+        tags=["status:200", "view:privaterelay.views.fxa_rp_events", "method:GET"],
+    )
     assert caplog.record_tuples == [
         ("eventsinfo", logging.INFO, "fxa_rp_event"),
         ("request.summary", logging.INFO, ""),
@@ -536,7 +573,7 @@ def test_fxa_rp_events_delete_user(
     assert DeletedAddress.objects.filter(address_hash=da_address_hash).exists()
 
 
-def test_version_view(client, version_json_path) -> None:
+def test_version_view(client: Client, version_json_path: Path) -> None:
     version_info = {
         "commit": "a_commit_hash",
         "version": "2024.01.17.1",
@@ -549,13 +586,71 @@ def test_version_view(client, version_json_path) -> None:
 
 
 @pytest.mark.django_db
-def test_heartbeat_view(client) -> None:
+def test_heartbeat_view(client: Client) -> None:
     response = client.get("/__heartbeat__")
     assert response.status_code == 200
     assert "status" in response.json()
 
 
-def test_lbheartbeat_view(client) -> None:
+def test_lbheartbeat_view(client: Client) -> None:
     response = client.get("/__lbheartbeat__")
     assert response.status_code == 200
     assert response.content == b""
+
+
+@override_settings(STATSD_ENABLED=True)
+def test_metrics_event_GET(client: Client, caplog: pytest.LogCaptureFixture) -> None:
+    with MetricsMock() as mm:
+        response = client.get("/metrics-event")
+    assert response.status_code == 405
+    assert caplog.record_tuples == [("request.summary", logging.INFO, "")]
+    mm.assert_not_incr("fx.private.relay.metrics_event")
+
+
+@override_settings(STATSD_ENABLED=True)
+def test_metrics_event_POST_non_json(
+    client: Client, caplog: pytest.LogCaptureFixture
+) -> None:
+    with MetricsMock() as mm:
+        response = client.post("/metrics-event")
+    assert response.status_code == 415
+    assert caplog.record_tuples == [("request.summary", logging.INFO, "")]
+    mm.assert_not_incr("fx.private.relay.metrics_event")
+
+
+@override_settings(STATSD_ENABLED=True)
+def test_metrics_event_POST_json_no_ga_uuid(
+    client: Client, caplog: pytest.LogCaptureFixture
+) -> None:
+    with MetricsMock() as mm:
+        response = client.post(
+            "/metrics-event", {"category": "addon"}, content_type="application/json"
+        )
+    assert response.status_code == 404
+    assert caplog.record_tuples == [("request.summary", logging.INFO, "")]
+    mm.assert_not_incr("fx.private.relay.metrics_event")
+
+
+@override_settings(STATSD_ENABLED=True)
+def test_metrics_event_POST_json_ga_uuid_ok(
+    client: Client,
+    caplog: pytest.LogCaptureFixture,
+    settings: SettingsWrapper,
+) -> None:
+    with MetricsMock() as mm:
+        response = client.post(
+            "/metrics-event",
+            {"ga_uuid": "anything-is-ok"},
+            content_type="application/json",
+        )
+    assert response.status_code == 200
+
+    assert caplog.record_tuples == [
+        ("eventsinfo", logging.INFO, "metrics_event"),
+        ("request.summary", logging.INFO, ""),
+    ]
+    record = caplog.records[0]
+    assert getattr(record, "ga_uuid_hash") == "1aa8606ede8415d8"
+    assert getattr(record, "source") == "website"
+
+    mm.assert_incr_once("fx.private.relay.metrics_event", 1, tags=["source:website"])

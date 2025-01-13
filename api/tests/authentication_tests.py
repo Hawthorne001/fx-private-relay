@@ -1,27 +1,22 @@
 from datetime import datetime
-
-from model_bakery import baker
-import responses
+from typing import NotRequired, TypedDict
 
 from django.core.cache import cache
 from django.test import RequestFactory, TestCase
 
+import responses
 from allauth.socialaccount.models import SocialAccount
-from rest_framework.exceptions import (
-    APIException,
-    AuthenticationFailed,
-    NotFound,
-)
+from model_bakery import baker
+from rest_framework.exceptions import APIException, AuthenticationFailed, NotFound
 from rest_framework.test import APIClient
 
 from ..authentication import (
+    INTROSPECT_TOKEN_URL,
     FxaTokenAuthentication,
     get_cache_key,
     get_fxa_uid_from_oauth_token,
     introspect_token,
-    INTROSPECT_TOKEN_URL,
 )
-
 
 MOCK_BASE = "api.authentication"
 
@@ -31,19 +26,30 @@ MOCK_BASE = "api.authentication"
 # nullable.
 
 
-def _setup_fxa_response(status_code: int, json: dict | str):
+class FxaResponse(TypedDict, total=False):
+    active: bool
+    sub: str
+    exp: int
+    error: str
+
+
+class CachedFxaResponse(TypedDict):
+    status_code: int
+    json: NotRequired[FxaResponse | str]
+
+
+def _setup_fxa_response(
+    status_code: int, json: FxaResponse | str | None = None
+) -> CachedFxaResponse:
     responses.add(
         responses.POST,
         INTROSPECT_TOKEN_URL,
         status=status_code,
         json=json,
     )
+    if json is None:
+        return {"status_code": status_code}
     return {"status_code": status_code, "json": json}
-
-
-def _setup_fxa_response_no_json(status_code: int):
-    responses.add(responses.POST, INTROSPECT_TOKEN_URL, status=status_code)
-    return {"status_code": status_code}
 
 
 class AuthenticationMiscellaneous(TestCase):
@@ -59,7 +65,7 @@ class AuthenticationMiscellaneous(TestCase):
 
     @responses.activate
     def test_introspect_token_catches_JSONDecodeError_raises_AuthenticationFailed(self):
-        _setup_fxa_response_no_json(200)
+        _setup_fxa_response(200)
         invalid_token = "invalid-123"
 
         try:
@@ -75,7 +81,11 @@ class AuthenticationMiscellaneous(TestCase):
         now_time = int(datetime.now().timestamp())
         # Note: FXA iat and exp are timestamps in *milliseconds*
         exp_time = (now_time + 60 * 60) * 1000
-        json_data = {"active": True, "sub": self.uid, "exp": exp_time}
+        json_data: FxaResponse = {
+            "active": True,
+            "sub": self.uid,
+            "exp": exp_time,
+        }
         status_code = 200
         expected_fxa_resp_data = {"status_code": status_code, "json": json_data}
         _setup_fxa_response(status_code, json_data)
@@ -116,7 +126,7 @@ class AuthenticationMiscellaneous(TestCase):
     def test_get_fxa_uid_from_oauth_token_status_code_None_uses_cached_response_returns_error_response(  # noqa: E501
         self,
     ) -> None:
-        _setup_fxa_response_no_json(200)
+        _setup_fxa_response(200)
         invalid_token = "invalid-123"
         cache_key = get_cache_key(invalid_token)
 
@@ -340,6 +350,27 @@ class FxaTokenAuthenticationTest(TestCase):
         # the code does NOT make another fxa request
         response = client.get("/api/v1/relayaddresses/")
         assert responses.assert_call_count(self.fxa_verify_path, 1) is True
+
+    @responses.activate
+    def test_200_resp_from_fxa_inactive_Relay_user_raises_APIException(self) -> None:
+        sa: SocialAccount = baker.make(SocialAccount, uid=self.uid, provider="fxa")
+        sa.user.is_active = False
+        sa.user.save()
+        now_time = int(datetime.now().timestamp())
+        # Note: FXA iat and exp are timestamps in *milliseconds*
+        exp_time = (now_time + 60 * 60) * 1000
+        _setup_fxa_response(200, {"active": True, "sub": self.uid, "exp": exp_time})
+        inactive_user_token = "inactive-user-123"
+        client = APIClient()
+        client.credentials(HTTP_AUTHORIZATION=f"Bearer {inactive_user_token}")
+
+        response = client.get("/api/v1/relayaddresses/")
+        assert response.status_code == 403
+        expected_detail = (
+            "Authenticated user does not have an active Relay account."
+            " Have they been deactivated?"
+        )
+        assert response.json()["detail"] == expected_detail
 
     @responses.activate
     def test_200_resp_from_fxa_for_user_returns_user_and_caches(self) -> None:
