@@ -1,21 +1,24 @@
 from django.conf import settings
-from django.urls import include, path, register_converter
+from django.urls import URLPattern, URLResolver, include, path, register_converter
 
 from drf_spectacular.views import (
     SpectacularAPIView,
     SpectacularRedocView,
-    SpectacularSwaggerView,
+    SpectacularSwaggerSplitView,
 )
 from rest_framework import routers
 
 from privaterelay.utils import enable_if_setting
-from .views import (
+
+from .views.emails import (
     DomainAddressViewSet,
     RelayAddressViewSet,
+    first_forwarded_email,
+)
+from .views.privaterelay import (
+    FlagViewSet,
     ProfileViewSet,
     UserViewSet,
-    FlagViewSet,
-    first_forwarded_email,
     report_webcompat_issue,
     runtime_data,
     terms_accepted_user,
@@ -43,7 +46,7 @@ api_router.register(r"users", UserViewSet, "user")
 api_router.register(r"flags", FlagViewSet, "flag")
 
 
-urlpatterns = [
+urlpatterns: list[URLPattern | URLResolver] = [
     path(
         "v1/runtime_data",
         runtime_data,
@@ -73,7 +76,7 @@ urlpatterns = [
     path(
         "v1/docs/",
         enable_if_setting("API_DOCS_ENABLED")(
-            SpectacularSwaggerView.as_view(url_name="schema")
+            SpectacularSwaggerSplitView.as_view(url_name="schema")
         ),
         name="schema-swagger-ui",
     ),
@@ -93,18 +96,18 @@ urlpatterns = [
 
 if settings.PHONES_ENABLED:
     from .views.phones import (
-        outbound_call,
-        list_messages,
-        outbound_sms,
+        InboundContactViewSet,
         RealPhoneViewSet,
         RelayNumberViewSet,
-        InboundContactViewSet,
         inbound_call,
         inbound_sms,
-        vCard,
-        sms_status,
-        voice_status,
+        list_messages,
+        outbound_call,
+        outbound_sms,
         resend_welcome_sms,
+        sms_status,
+        vCard,
+        voice_status,
     )
 
 if settings.PHONES_ENABLED:
@@ -143,11 +146,11 @@ if settings.PHONES_ENABLED:
         ),
         path("v1/sms_status/", sms_status, name="sms_status"),
         path(
-            "v1/vCard/<lookup_key>",
+            "v1/vCard/<str:lookup_key>",
             vCard,
             name="vCard_deprecate_after_updating_clients",
         ),
-        path("v1/vCard/<lookup_key>/", vCard, name="vCard"),
+        path("v1/vCard/<str:lookup_key>/", vCard, name="vCard"),
         path(
             "v1/realphone/resend_welcome_sms",
             resend_welcome_sms,

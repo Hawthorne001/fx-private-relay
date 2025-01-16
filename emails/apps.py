@@ -1,16 +1,24 @@
 import logging
 import os
+from typing import NamedTuple
+
+from django.apps import AppConfig, apps
+from django.conf import settings
+from django.utils.functional import cached_property
 
 import boto3
 from botocore.config import Config
-from django.utils.functional import cached_property
 from mypy_boto3_ses.client import SESClient
 
-from django.apps import apps, AppConfig
-from django.conf import settings
-
-
 logger = logging.getLogger("events")
+
+
+# Bad words are split into short and long words
+class BadWords(NamedTuple):
+    # Short words are 4 or less characters. A hit is an exact match to a short word
+    short: set[str]
+    # Long words are 5 or more characters. A hit contains a long word.
+    long: list[str]
 
 
 class EmailsConfig(AppConfig):
@@ -47,26 +55,30 @@ class EmailsConfig(AppConfig):
         # https://www.cs.cmu.edu/~biglou/resources/bad-words.txt
         # Using `.text` extension because of
         # https://github.com/dependabot/dependabot-core/issues/1657
-        self.badwords = self._load_terms("badwords.text")
-        self.blocklist = self._load_terms("blocklist.text")
+        _badwords = self._load_terms("badwords.text")
+        self.badwords = BadWords(
+            short=set(word for word in _badwords if len(word) <= 4),
+            long=sorted(set(word for word in _badwords if len(word) > 4)),
+        )
+        self.blocklist = set(self._load_terms("blocklist.text"))
 
-    def _load_terms(self, filename):
+    def _load_terms(self, filename: str) -> list[str]:
+        """Load a list of terms from a file."""
         terms = []
         terms_file_path = os.path.join(settings.BASE_DIR, "emails", filename)
         with open(terms_file_path) as terms_file:
-            for word in terms_file:
-                if len(word.strip()) > 0 and word.strip()[0] == "#":
+            for raw_word in terms_file:
+                word = raw_word.strip()
+                if not word or (len(word) > 0 and word[0] == "#"):
                     continue
-                terms.append(word.strip())
+                terms.append(word)
         return terms
-
-    def ready(self):
-        import emails.signals  # noqa: F401 (imported but unused warning)
 
 
 def emails_config() -> EmailsConfig:
     emails_config = apps.get_app_config("emails")
-    assert isinstance(emails_config, EmailsConfig)
+    if not isinstance(emails_config, EmailsConfig):
+        raise TypeError("emails_config must be type EmailsConfig")
     return emails_config
 
 

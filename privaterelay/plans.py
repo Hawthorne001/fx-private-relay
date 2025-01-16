@@ -62,7 +62,7 @@ on first use to create the PlanCountryLangMapping, and served from cache on late
 
 from copy import deepcopy
 from functools import lru_cache
-from typing import get_args, Literal, TypedDict
+from typing import Literal, TypedDict, get_args
 
 from django.conf import settings
 
@@ -127,6 +127,7 @@ CountryStr = Literal[
     "NL",  # Netherlands
     "NZ",  # New Zealand
     "PL",  # Poland
+    "PR",  # Puerto Rico
     "PT",  # Portugal
     "RO",  # Romania
     "SE",  # Sweden
@@ -329,7 +330,7 @@ _STRIPE_PLAN_DATA: _StripePlanData = {
             },
             "HU": {  # Hungary
                 "currency": "EUR",
-                "monthly_id": "price_1NOOJAJNcmPzuWtRV7Kmwmdm",
+                "monthly_id": "price_1PYB6XJNcmPzuWtR5Ff9cW3D",
                 "yearly_id": "price_1NOOKvJNcmPzuWtR2DEWIRE4",
             },
             "IE": {  # Ireland
@@ -493,6 +494,7 @@ _RELAY_PLANS: _RelayPlans = {
             "CA": "US",  # Canada -> United States
             "MY": "GB",  # Malaysia -> United Kingdom
             "NZ": "GB",  # New Zealand -> United Kingdom
+            "PR": "US",  # Puerto Rico -> United States
             "SG": "GB",  # Singapore -> United Kingdom
         },
         "by_country_and_lang": {
@@ -510,11 +512,17 @@ _RELAY_PLANS: _RelayPlans = {
     },
     "phones": {
         "by_country": ["US"],  # United States
-        "by_country_override": {"CA": "US"},  # Canada -> United States
+        "by_country_override": {
+            "CA": "US",  # Canada -> United States
+            "PR": "US",  # Puerto Rico -> United States
+        },
     },
     "bundle": {
         "by_country": ["US"],  # United States
-        "by_country_override": {"CA": "US"},  # Canada -> United States
+        "by_country_override": {
+            "CA": "US",  # Canada -> United States
+            "PR": "US",  # Puerto Rico -> United States
+        },
     },
 }
 
@@ -557,15 +565,18 @@ def _cached_country_language_mapping(
 
     mapping: PlanCountryLangMapping = {}
     for relay_country in relay_maps.get("by_country", []):
-        assert relay_country not in mapping
+        if relay_country in mapping:
+            raise ValueError("relay_country should not be in mapping.")
         mapping[relay_country] = {"*": _get_stripe_prices(relay_country, stripe_data)}
 
     for relay_country, override in relay_maps.get("by_country_override", {}).items():
-        assert relay_country not in mapping
+        if relay_country in mapping:
+            raise ValueError("relay_country should not be in mapping.")
         mapping[relay_country] = {"*": _get_stripe_prices(override, stripe_data)}
 
     for relay_country, languages in relay_maps.get("by_country_and_lang", {}).items():
-        assert relay_country not in mapping
+        if relay_country in mapping:
+            raise ValueError("relay_country should not be in mapping.")
         mapping[relay_country] = {
             lang: _get_stripe_prices(stripe_country, stripe_data)
             for lang, stripe_country in languages.items()
@@ -586,16 +597,19 @@ def _get_stripe_prices(
         # mypy thinks stripe_details _could_ be _StripeYearlyPriceDetails,
         # so extra asserts are needed to make mypy happy.
         monthly_id = str(stripe_details.get("monthly_id"))
-        assert monthly_id.startswith("price_")
+        if not monthly_id.startswith("price_"):
+            raise ValueError("monthly_id must start with 'price_'")
         price = prices.get("monthly", 0.0)
-        assert price and isinstance(price, float)
+        if not isinstance(price, float):
+            raise TypeError("price must be of type float.")
         period_to_details["monthly"] = {
             "id": monthly_id,
             "currency": currency,
             "price": price,
         }
     yearly_id = stripe_details["yearly_id"]
-    assert yearly_id.startswith("price_")
+    if not yearly_id.startswith("price_"):
+        raise ValueError("yearly_id must start with 'price_'")
     period_to_details["yearly"] = {
         "id": yearly_id,
         "currency": currency,

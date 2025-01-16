@@ -1,13 +1,12 @@
-from datetime import datetime, timezone
-from typing import Any
 import logging
 import shlex
-
-import requests
+from datetime import UTC, datetime
+from typing import Any
 
 from django.conf import settings
 from django.core.cache import cache
 
+import requests
 from allauth.socialaccount.models import SocialAccount
 from rest_framework.authentication import BaseAuthentication, get_authorization_header
 from rest_framework.exceptions import (
@@ -18,10 +17,9 @@ from rest_framework.exceptions import (
     PermissionDenied,
 )
 
-
 logger = logging.getLogger("events")
-INTROSPECT_TOKEN_URL = (
-    "%s/introspect" % settings.SOCIALACCOUNT_PROVIDERS["fxa"]["OAUTH_ENDPOINT"]
+INTROSPECT_TOKEN_URL = "{}/introspect".format(
+    settings.SOCIALACCOUNT_PROVIDERS["fxa"]["OAUTH_ENDPOINT"]
 )
 
 
@@ -31,7 +29,11 @@ def get_cache_key(token):
 
 def introspect_token(token: str) -> dict[str, Any]:
     try:
-        fxa_resp = requests.post(INTROSPECT_TOKEN_URL, json={"token": token})
+        fxa_resp = requests.post(
+            INTROSPECT_TOKEN_URL,
+            json={"token": token},
+            timeout=settings.FXA_REQUESTS_TIMEOUT_SECONDS,
+        )
     except Exception as exc:
         logger.error(
             "Could not introspect token with FXA.",
@@ -51,7 +53,7 @@ def introspect_token(token: str) -> dict[str, Any]:
     return fxa_resp_data
 
 
-def get_fxa_uid_from_oauth_token(token: str, use_cache=True) -> str:
+def get_fxa_uid_from_oauth_token(token: str, use_cache: bool = True) -> str:
     # set a default cache_timeout, but this will be overriden to match
     # the 'exp' time in the JWT returned by FxA
     cache_timeout = 60
@@ -95,10 +97,10 @@ def get_fxa_uid_from_oauth_token(token: str, use_cache=True) -> str:
 
     # cache valid access_token and fxa_resp_data until access_token expiration
     # TODO: revisit this since the token can expire before its time
-    if type(fxa_resp_data.get("json", {}).get("exp")) is int:
+    if isinstance(fxa_resp_data.get("json", {}).get("exp"), int):
         # Note: FXA iat and exp are timestamps in *milliseconds*
         fxa_token_exp_time = int(fxa_resp_data["json"]["exp"] / 1000)
-        now_time = int(datetime.now(timezone.utc).timestamp())
+        now_time = int(datetime.now(UTC).timestamp())
         fxa_token_exp_cache_timeout = fxa_token_exp_time - now_time
         if fxa_token_exp_cache_timeout > cache_timeout:
             # cache until access_token expires (matched Relay user)
@@ -145,6 +147,12 @@ class FxaTokenAuthentication(BaseAuthentication):
                 " Have they accepted the terms?"
             )
         user = sa.user
+
+        if not user.is_active:
+            raise PermissionDenied(
+                "Authenticated user does not have an active Relay account."
+                " Have they been deactivated?"
+            )
 
         if user:
             return (user, token)

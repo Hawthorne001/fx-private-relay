@@ -1,21 +1,23 @@
 from __future__ import annotations
+
+import logging
+import textwrap
 from argparse import RawDescriptionHelpFormatter
 from shutil import get_terminal_size
-from typing import Any, Optional, TYPE_CHECKING
-
-import textwrap
-import logging
+from typing import TYPE_CHECKING, Any
 
 from django.core.management.base import BaseCommand, DjangoHelpFormatter
+from django.db import transaction
 
 from codetiming import Timer
 
-from emails.cleaners import ServerStorageCleaner, MissingProfileCleaner
-
+from emails.cleaners import MissingProfileCleaner, ServerStorageCleaner
+from privaterelay.cleaners import MissingEmailCleaner
 
 if TYPE_CHECKING:  # pragma: no cover
     from argparse import ArgumentParser
-    from privaterelay.cleaners import DataIssueTask
+
+    from privaterelay.cleaner_task import DataIssueTask
 
 
 logger = logging.getLogger("eventsinfo.cleanup_data")
@@ -32,6 +34,7 @@ class Command(BaseCommand):
     task_list: list[type[DataIssueTask]] = [
         ServerStorageCleaner,
         MissingProfileCleaner,
+        MissingEmailCleaner,
     ]
     tasks: dict[str, DataIssueTask]
 
@@ -57,7 +60,8 @@ class Command(BaseCommand):
         epilog = "\n".join(epilog_lines)
 
         parser = super().create_parser(prog_name, subcommand, epilog=epilog, **kwargs)
-        assert parser.formatter_class == DjangoHelpFormatter
+        if not parser.formatter_class == DjangoHelpFormatter:
+            raise TypeError("parser.formatter_class must be type DjangoHelpFormatter")
         parser.formatter_class = RawDescriptionDjangoHelpFormatter
         return parser
 
@@ -72,12 +76,8 @@ class Command(BaseCommand):
                 help=f"Only run {slug} {'cleaner' if task.can_clean else 'detector'}",
             )
 
-    def handle(self, *args, **kwargs) -> str:
+    def handle(self, clean: bool, verbosity: int, *args: Any, **kwargs: Any) -> str:
         """Run the cleanup_data command."""
-
-        # Parse command line options
-        to_clean = kwargs["clean"]
-        verbosity = kwargs["verbosity"]
 
         # Determine if we're running some tasks or the full set
         run_some: list[str] = []
@@ -91,59 +91,64 @@ class Command(BaseCommand):
             tasks = self.tasks
 
         # Find data issues and clean them if requested
-        issue_count, issue_timers = self.find_issues(tasks)
-        if to_clean:
-            clean_count, clean_timers = self.clean_issues(tasks)
+        issue_count = 0
+        clean_count = 0
+        issue_timers: dict[str, float] = {}
+        clean_timers: dict[str, float] = {}
+        for slug, task in tasks.items():
+            with transaction.atomic():
+                task_issues, task_time = self.find_issues_in_task(task)
+                issue_count += task_issues
+                issue_timers[slug] = task_time
+
+                if clean:
+                    task_cleaned, clean_time = self.clean_issues_in_task(task)
+                    if task_cleaned is not None and clean_time is not None:
+                        clean_count += task_cleaned
+                        clean_timers[slug] = clean_time
+
+        # Log results and create a report, based on requested verbosity
+        if clean:
             log_message = (
                 f"cleanup_data complete, cleaned {clean_count} of"
                 f" {issue_count} issue{'' if issue_count==1 else 's'}."
             )
         else:
-            clean_timers = None
             log_message = (
                 f"cleanup_data complete, found {issue_count}"
                 f" issue{'' if issue_count==1 else 's'} (dry run)."
             )
 
-        # Log results and create a report, based on requested verbosity
         full_data, log_data = self.prepare_data(
-            to_clean, verbosity, tasks, issue_timers, clean_timers=clean_timers
+            clean, verbosity, tasks, issue_timers, clean_timers=clean_timers
         )
         logger.info(log_message, extra=log_data)
         report = self.get_report(log_message, full_data)
         return report
 
-    def find_issues(
-        self, tasks: dict[str, DataIssueTask]
-    ) -> tuple[int, dict[str, float]]:
-        """Run each task and accumulate the total detected issues."""
-        total = 0
-        timers: dict[str, float] = {}
-        for slug, task in tasks.items():
-            with Timer(logger=None) as issue_timer:
-                total += task.issues()
-            timers[slug] = round(issue_timer.last, 3)
-        return total, timers
+    def find_issues_in_task(self, task: DataIssueTask) -> tuple[int, float]:
+        """Run a task, returning the number of issues and execution time."""
+        with Timer(logger=None) as issue_timer:
+            total = task.issues()
+        return total, round(issue_timer.last, 3)
 
-    def clean_issues(
-        self, tasks: dict[str, DataIssueTask]
-    ) -> tuple[int, dict[str, float]]:
-        """Clean detected issues, if the task supports cleaning."""
-        total = 0
-        timers: dict[str, float] = {}
-        for slug, task in tasks.items():
-            with Timer(logger=None) as clean_timer:
-                total += task.clean()
-            timers[slug] = round(clean_timer.last, 3)
-        return total, timers
+    def clean_issues_in_task(
+        self, task: DataIssueTask
+    ) -> tuple[int, float] | tuple[None, None]:
+        """Run the task cleaner, returning issues cleaned and execution time."""
+        if not hasattr(task, "clean"):
+            return (None, None)
+        with Timer(logger=None) as clean_timer:
+            cleaned = task.clean()
+        return cleaned, round(clean_timer.last, 3)
 
     def prepare_data(
         self,
-        to_clean: bool,
+        cleaned: bool,
         verbosity: int,
         tasks: dict[str, DataIssueTask],
         issue_timers: dict[str, float],
-        clean_timers: dict[str, float] | None,
+        clean_timers: dict[str, float],
     ) -> tuple[dict, dict]:
         """Gather full data and log data from tasks and timers."""
 
@@ -174,13 +179,13 @@ class Command(BaseCommand):
 
         full_data = {
             "verbosity": verbosity,
-            "cleaned": to_clean,
+            "cleaned": cleaned,
             "timers": timers,
             "tasks": full_details,
         }
 
         log_data = {
-            "cleaned": to_clean,
+            "cleaned": cleaned,
             "timers": timers,
         }
         if log_details:

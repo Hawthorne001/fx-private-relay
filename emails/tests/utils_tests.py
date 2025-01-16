@@ -1,20 +1,26 @@
-from base64 import b64encode
-from typing import Literal
-from urllib.parse import quote_plus
-from django.test import TestCase, override_settings
-from unittest.mock import patch
+import base64
 import json
+import random
+import zlib
+from base64 import b64encode
+from typing import Literal, TypedDict
+from unittest.mock import patch
+from urllib.parse import quote_plus
+
+from django.test import TestCase, override_settings
+
 import pytest
 
 from emails.utils import (
+    InvalidFromHeader,
+    decode_dict_gza85,
+    encode_dict_gza85,
     generate_from_header,
     get_domains_from_settings,
     get_email_domain_from_settings,
     parse_email_header,
     remove_trackers,
-    InvalidFromHeader,
 )
-from .models_tests import make_free_test_user, make_premium_test_user  # noqa: F401
 
 
 class GetEmailDomainFromSettingsTest(TestCase):
@@ -141,12 +147,17 @@ GENERATE_FROM_HEADER_RAISES_CASES = {
     GENERATE_FROM_HEADER_RAISES_CASES.values(),
     ids=GENERATE_FROM_HEADER_RAISES_CASES.keys(),
 )
-def test_generate_from_header_raises(address) -> None:
+def test_generate_from_header_raises(address: str) -> None:
     with pytest.raises(InvalidFromHeader):
         generate_from_header(address, "failures@relay.example.com")
 
 
-PARSE_EMAIL_HEADER_CASES = {
+class ParseEmailHeaderCase(TypedDict):
+    header_value: str
+    expected_out: list[tuple[str, str]]
+
+
+PARSE_EMAIL_HEADER_CASES: dict[str, ParseEmailHeaderCase] = {
     "email_only": {
         "header_value": "email_only@simple.example.com",
         "expected_out": [("", "email_only@simple.example.com")],
@@ -204,7 +215,7 @@ PARSE_EMAIL_HEADER_CASES = {
     PARSE_EMAIL_HEADER_CASES.values(),
     ids=PARSE_EMAIL_HEADER_CASES.keys(),
 )
-def test_parse_email_header(params) -> None:
+def test_parse_email_header(params: ParseEmailHeaderCase) -> None:
     out = parse_email_header(params["header_value"])
     assert out == params["expected_out"]
 
@@ -385,3 +396,58 @@ class RemoveTrackers(TestCase):
         assert changed_content == content
         assert general_removed == 0
         assert general_count == 0
+
+
+def test_encode_dict_gza85() -> None:
+    data = {"key": "value"}
+    encoded = encode_dict_gza85(data)
+    assert encoded == "Gatg8b\"f'<Z;OLK9?\\hZ<N63&/$B+B"
+    decoded = decode_dict_gza85(encoded)
+    assert decoded == data
+
+
+def test_encode_dict_gza85_large_value() -> None:
+    data = {
+        "key": "value",
+        "random_strings": [
+            base64.encodebytes(random.randbytes(32)).decode() for _ in range(100)
+        ],
+    }
+    encoded = encode_dict_gza85(data)
+    assert len(encoded) > 1024
+    assert "\n" in encoded
+    decoded = decode_dict_gza85(encoded)
+    assert decoded == data
+
+
+DECODE_DICT_GZA85_ERROR_CASES = {
+    "invalid_zlib": ("ascii85_garbage", zlib.error, "incorrect header check"),
+    "invalid_a85": ("v_is_invalid_ASCII85", ValueError, "Non-Ascii85 digit found: v"),
+    "not_json": (
+        base64.a85encode(zlib.compress(b"[This] is {not} JSON"), pad=True).decode(),
+        ValueError,
+        "Expecting value: line 1 column 2",
+    ),
+    "not_json_dict": (
+        base64.a85encode(zlib.compress(b'["A", "list"]'), pad=True).decode(),
+        ValueError,
+        "Encoded data is not a dict",
+    ),
+    "non_string_key": (
+        base64.a85encode(zlib.compress(b'{1: "One"}'), pad=True).decode(),
+        ValueError,
+        "Expecting property name enclosed in double quotes",
+    ),
+}
+
+
+@pytest.mark.parametrize(
+    "invalid_encoded, expected_error, expected_regex",
+    DECODE_DICT_GZA85_ERROR_CASES.values(),
+    ids=DECODE_DICT_GZA85_ERROR_CASES.keys(),
+)
+def test_decode_dict_gza85_invalid_encoded_raises(
+    invalid_encoded, expected_error, expected_regex
+):
+    with pytest.raises(expected_error, match=expected_regex):
+        decode_dict_gza85(invalid_encoded)

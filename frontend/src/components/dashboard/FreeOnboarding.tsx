@@ -13,8 +13,8 @@ import WorkingMan from "./images/free-onboarding-work-anywhere.svg";
 import Extension from "./images/free-onboarding-relay-extension.svg";
 import SmallArrow from "./images/free-onboarding-arrow.svg";
 import LargeArrow from "./images/free-onboarding-arrow-large.svg";
-import Image from "next/image";
 import { Button, LinkButton } from "../Button";
+import Image from "../Image";
 import { useGaViewPing } from "../../hooks/gaViewPing";
 import { useGaEvent } from "../../hooks/gaEvent";
 import { AliasData } from "../../hooks/api/aliases";
@@ -93,7 +93,7 @@ export const FreeOnboarding = (props: Props) => {
 
       try {
         await props.generateNewMask({ mask_type: "random" });
-      } catch (e) {
+      } catch (_e) {
         // On error, we can only move to the next step if the user has atleast 1 mask.
         if (!props.hasAtleastOneMask) {
           moveToNextStep = false;

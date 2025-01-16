@@ -1,68 +1,86 @@
-from dataclasses import asdict, dataclass, field
-from datetime import datetime, timezone
+from __future__ import annotations
+
 import hashlib
 import logging
 import re
 import string
+from dataclasses import asdict, dataclass, field
+from datetime import UTC, datetime
 from typing import Any, Literal
-
-from waffle import get_waffle_flag_model
-import django_ftl
-import phonenumbers
 
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.core.exceptions import ObjectDoesNotExist
+from django.db.models.query import QuerySet
 from django.forms import model_to_dict
 
-from drf_spectacular.utils import extend_schema, OpenApiParameter
+import django_ftl
+import phonenumbers
+from drf_spectacular.utils import (
+    OpenApiExample,
+    OpenApiParameter,
+    OpenApiRequest,
+    OpenApiResponse,
+    extend_schema,
+)
 from rest_framework import (
     decorators,
+    exceptions,
     permissions,
     response,
     throttling,
     viewsets,
-    exceptions,
 )
 from rest_framework.generics import get_object_or_404
 from rest_framework.request import Request
-
 from twilio.base.exceptions import TwilioRestException
-from waffle import flag_is_active
+from waffle import flag_is_active, get_waffle_flag_model
 
 from api.views import SaveToRequestUser
 from emails.utils import incr_if_enabled
-from phones.iq_utils import send_iq_sms
-
 from phones.apps import phones_config, twilio_client
+from phones.exceptions import (
+    FullNumberMatchesNoSenders,
+    MultipleNumberMatches,
+    NoBodyAfterFullNumber,
+    NoBodyAfterShortPrefix,
+    NoPhoneLog,
+    NoPreviousSender,
+    RelaySMSException,
+    ShortPrefixMatchesNoSenders,
+)
+from phones.iq_utils import send_iq_sms
 from phones.models import (
+    DEFAULT_REGION,
     InboundContact,
     RealPhone,
     RelayNumber,
+    area_code_numbers,
     get_last_text_sender,
-    get_pending_unverified_realphone_records,
-    get_valid_realphone_verification_record,
-    get_verified_realphone_record,
-    get_verified_realphone_records,
+    location_numbers,
     send_welcome_message,
     suggested_numbers,
-    location_numbers,
-    area_code_numbers,
 )
 from privaterelay.ftl_bundles import main as ftl_bundle
 
-from ..exceptions import ConflictError, ErrorContextType
+from ..exceptions import ConflictError
 from ..permissions import HasPhoneService
-from ..renderers import (
-    TemplateTwiMLRenderer,
-    vCardRenderer,
-)
+from ..renderers import TemplateTwiMLRenderer, vCardRenderer
 from ..serializers.phones import (
     InboundContactSerializer,
+    IqInboundSmsSerializer,
+    OutboundCallSerializer,
+    OutboundSmsSerializer,
     RealPhoneSerializer,
     RelayNumberSerializer,
+    TwilioInboundCallSerializer,
+    TwilioInboundSmsSerializer,
+    TwilioMessagesSerializer,
+    TwilioNumberSuggestion,
+    TwilioNumberSuggestionGroups,
+    TwilioSmsStatusSerializer,
+    TwilioVoiceStatusSerializer,
 )
-
 
 logger = logging.getLogger("events")
 info_logger = logging.getLogger("eventsinfo")
@@ -80,6 +98,7 @@ class RealPhoneRateThrottle(throttling.UserRateThrottle):
     rate = settings.PHONE_RATE_LIMIT
 
 
+@extend_schema(tags=["phones"])
 class RealPhoneViewSet(SaveToRequestUser, viewsets.ModelViewSet):
     """
     Get real phone number records for the authenticated user.
@@ -99,9 +118,10 @@ class RealPhoneViewSet(SaveToRequestUser, viewsets.ModelViewSet):
     # TODO: this doesn't seem to e working?
     throttle_classes = [RealPhoneRateThrottle]
 
-    def get_queryset(self):
-        assert isinstance(self.request.user, User)
-        return RealPhone.objects.filter(user=self.request.user)
+    def get_queryset(self) -> QuerySet[RealPhone]:
+        if isinstance(self.request.user, User):
+            return RealPhone.objects.filter(user=self.request.user)
+        return RealPhone.objects.none()
 
     def create(self, request):
         """
@@ -139,10 +159,15 @@ class RealPhoneViewSet(SaveToRequestUser, viewsets.ModelViewSet):
         # number and verification code and mark it verified.
         verification_code = serializer.validated_data.get("verification_code")
         if verification_code:
-            valid_record = get_valid_realphone_verification_record(
-                request.user, serializer.validated_data["number"], verification_code
-            )
-            if not valid_record:
+            try:
+                valid_record = (
+                    RealPhone.recent_objects.get_for_user_number_and_verification_code(
+                        request.user,
+                        serializer.validated_data["number"],
+                        verification_code,
+                    )
+                )
+            except RealPhone.DoesNotExist:
                 incr_if_enabled("phones_RealPhoneViewSet.create.invalid_verification")
                 raise exceptions.ValidationError(
                     "Could not find that verification_code for user and number."
@@ -166,16 +191,16 @@ class RealPhoneViewSet(SaveToRequestUser, viewsets.ModelViewSet):
 
         # to prevent sending verification codes to verified numbers,
         # check if the number is already a verified number.
-        is_verified = get_verified_realphone_record(serializer.validated_data["number"])
-        if is_verified:
+        if RealPhone.verified_objects.exists_for_number(
+            serializer.validated_data["number"]
+        ):
             raise ConflictError("A verified record already exists for this number.")
 
         # to prevent abusive sending of verification messages,
-        # check if there is an un-expired verification code for the user
-        pending_unverified_records = get_pending_unverified_realphone_records(
+        # check if there is an un-expired verification code for number
+        if RealPhone.pending_objects.exists_for_number(
             serializer.validated_data["number"]
-        )
-        if pending_unverified_records:
+        ):
             raise ConflictError(
                 "An unverified record already exists for this number.",
             )
@@ -255,14 +280,16 @@ class RealPhoneViewSet(SaveToRequestUser, viewsets.ModelViewSet):
         return super().destroy(request, *args, **kwargs)
 
 
+@extend_schema(tags=["phones"])
 class RelayNumberViewSet(SaveToRequestUser, viewsets.ModelViewSet):
     http_method_names = ["get", "post", "patch"]
     permission_classes = [permissions.IsAuthenticated, HasPhoneService]
     serializer_class = RelayNumberSerializer
 
-    def get_queryset(self):
-        assert isinstance(self.request.user, User)
-        return RelayNumber.objects.filter(user=self.request.user)
+    def get_queryset(self) -> QuerySet[RelayNumber]:
+        if isinstance(self.request.user, User):
+            return RelayNumber.objects.filter(user=self.request.user)
+        return RelayNumber.objects.none()
 
     def create(self, request, *args, **kwargs):
         """
@@ -305,6 +332,41 @@ class RelayNumberViewSet(SaveToRequestUser, viewsets.ModelViewSet):
         incr_if_enabled("phones_RelayNumberViewSet.partial_update")
         return super().partial_update(request, *args, **kwargs)
 
+    @extend_schema(
+        responses={
+            "200": OpenApiResponse(
+                TwilioNumberSuggestionGroups(),
+                description="Suggested numbers based on the user's real number",
+                examples=[
+                    OpenApiExample(
+                        "suggestions",
+                        {
+                            "real_num": "4045556789",
+                            "same_prefix_options": [],
+                            "other_areas_options": [],
+                            "same_area_options": [],
+                            "random_options": [
+                                {
+                                    "friendly_name": "(256) 555-3456",
+                                    "iso_country": "US",
+                                    "locality": "Gadsden",
+                                    "phone_number": "+12565553456",
+                                    "postal_code": "35903",
+                                    "region": "AL",
+                                }
+                            ],
+                        },
+                    )
+                ],
+            ),
+            "400": OpenApiResponse(
+                description=(
+                    "User has not verified their real number,"
+                    " or already has a Relay number."
+                )
+            ),
+        },
+    )
     @decorators.action(detail=False)
     def suggestions(self, request):
         """
@@ -322,6 +384,44 @@ class RelayNumberViewSet(SaveToRequestUser, viewsets.ModelViewSet):
         numbers = suggested_numbers(request.user)
         return response.Response(numbers)
 
+    @extend_schema(
+        parameters=[
+            OpenApiParameter(
+                "location",
+                required=False,
+                location="query",
+                examples=[OpenApiExample("Miami FL USA", "Miami")],
+            ),
+            OpenApiParameter(
+                "area_code",
+                required=False,
+                location="query",
+                examples=[OpenApiExample("Tulsa OK USA", "918")],
+            ),
+        ],
+        responses={
+            "200": OpenApiResponse(
+                TwilioNumberSuggestion(many=True),
+                description="List of available numbers",
+                examples=[
+                    OpenApiExample(
+                        "Tulsa, OK",
+                        {
+                            "friendly_name": "(918) 555-6789",
+                            "iso_country": "US",
+                            "locality": "Tulsa",
+                            "phone_number": "+19185556789",
+                            "postal_code": "74120",
+                            "region": "OK",
+                        },
+                    )
+                ],
+            ),
+            "404": OpenApiResponse(
+                description="Neither location or area_code was specified"
+            ),
+        },
+    )
     @decorators.action(detail=False)
     def search(self, request):
         """
@@ -338,11 +438,12 @@ class RelayNumberViewSet(SaveToRequestUser, viewsets.ModelViewSet):
         [apn]: https://www.twilio.com/docs/phone-numbers/api/availablephonenumberlocal-resource#read-multiple-availablephonenumberlocal-resources
         """  # noqa: E501  # ignore long line for URL
         incr_if_enabled("phones_RelayNumberViewSet.search")
-        real_phone = get_verified_realphone_records(request.user).first()
-        if real_phone:
-            country_code = real_phone.country_code
-        else:
-            country_code = "US"
+        try:
+            country_code = RealPhone.verified_objects.country_code_for_user(
+                request.user
+            )
+        except RealPhone.DoesNotExist:
+            country_code = DEFAULT_REGION
         location = request.query_params.get("location")
         if location is not None:
             numbers = location_numbers(location, country_code)
@@ -356,14 +457,17 @@ class RelayNumberViewSet(SaveToRequestUser, viewsets.ModelViewSet):
         return response.Response({}, 404)
 
 
+@extend_schema(tags=["phones"])
 class InboundContactViewSet(viewsets.ModelViewSet):
     http_method_names = ["get", "patch"]
     permission_classes = [permissions.IsAuthenticated, HasPhoneService]
     serializer_class = InboundContactSerializer
 
-    def get_queryset(self):
-        request_user_relay_num = get_object_or_404(RelayNumber, user=self.request.user)
-        return InboundContact.objects.filter(relay_number=request_user_relay_num)
+    def get_queryset(self) -> QuerySet[InboundContact]:
+        if isinstance(self.request.user, User):
+            relay_number = get_object_or_404(RelayNumber, user=self.request.user)
+            return InboundContact.objects.filter(relay_number=relay_number)
+        return InboundContact.objects.none()
 
 
 def _validate_number(request, number_field="number"):
@@ -427,10 +531,30 @@ def _get_number_details(e164_number):
         return None
 
 
+@extend_schema(
+    tags=["phones"],
+    responses={
+        "200": OpenApiResponse(
+            bytes,
+            description="A Virtual Contact File (VCF) for the user's Relay number.",
+            examples=[
+                OpenApiExample(
+                    name="partial VCF",
+                    media_type="text/x-vcard",
+                    value=(
+                        "BEGIN:VCARD\nVERSION:3.0\nFN:Firefox Relay\n"
+                        "TEL:+14045555555\nEND:VCARD\n"
+                    ),
+                )
+            ],
+        ),
+        "404": OpenApiResponse(description="No or unknown lookup key"),
+    },
+)
 @decorators.api_view()
 @decorators.permission_classes([permissions.AllowAny])
 @decorators.renderer_classes([vCardRenderer])
-def vCard(request, lookup_key):
+def vCard(request: Request, lookup_key: str) -> response.Response:
     """
     Get a Relay vCard. `lookup_key` should be passed in url path.
 
@@ -452,6 +576,19 @@ def vCard(request, lookup_key):
     return resp
 
 
+@extend_schema(
+    tags=["phones"],
+    request=OpenApiRequest(),
+    responses={
+        "200": OpenApiResponse(
+            {"type": "object"},
+            description="Welcome message sent.",
+            examples=[OpenApiExample("success", {"msg": "sent"})],
+        ),
+        "401": OpenApiResponse(description="Not allowed"),
+        "404": OpenApiResponse(description="User does not have a Relay number."),
+    },
+)
 @decorators.api_view(["POST"])
 @decorators.permission_classes([permissions.IsAuthenticated, HasPhoneService])
 def resend_welcome_sms(request):
@@ -484,22 +621,80 @@ def message_body(from_num, body):
     return f"[Relay 📲 {from_num}] {body}"
 
 
-def _get_user_error_message(real_phone: RealPhone, sms_exception) -> Any:
-    # Send a translated message to the user
-    ftl_code = sms_exception.get_codes().replace("_", "-")
-    ftl_id = f"sms-error-{ftl_code}"
-    # log the error in English
-    with django_ftl.override("en"):
-        logger.exception(ftl_bundle.format(ftl_id, sms_exception.error_context()))
+def _log_sms_exception(
+    phone_provider: Literal["twilio", "iq"],
+    real_phone: RealPhone,
+    sms_exception: RelaySMSException,
+) -> None:
+    """Log SMS exceptions for incoming requests from the provider."""
+    context = sms_exception.error_context()
+    context["phone_provider"] = phone_provider
+    context["fxa_id"] = real_phone.user.profile.metrics_fxa_id
+    info_logger.info(sms_exception.default_code, context)
+
+
+def _get_user_error_message(
+    real_phone: RealPhone, sms_exception: RelaySMSException
+) -> Any:
+    """Generate a translated message for the user."""
     with django_ftl.override(real_phone.user.profile.language):
-        user_message = ftl_bundle.format(ftl_id, sms_exception.error_context())
+        user_message = ftl_bundle.format(
+            sms_exception.ftl_id, sms_exception.error_context()
+        )
     return user_message
 
 
+@extend_schema(
+    tags=["phones: Twilio"],
+    parameters=[
+        OpenApiParameter(name="X-Twilio-Signature", required=True, location="header"),
+    ],
+    request=OpenApiRequest(
+        TwilioInboundSmsSerializer,
+        examples=[
+            OpenApiExample(
+                "request",
+                {"to": "+13035556789", "from": "+14045556789", "text": "Hello!"},
+            )
+        ],
+    ),
+    responses={
+        "200": OpenApiResponse(
+            {"type": "string", "xml": {"name": "Response"}},
+            description="The number is disabled.",
+            examples=[OpenApiExample("disabled", None)],
+        ),
+        "201": OpenApiResponse(
+            {"type": "string", "xml": {"name": "Response"}},
+            description="Forward the message to the user.",
+            examples=[OpenApiExample("success", None)],
+        ),
+        "400": OpenApiResponse(
+            {"type": "object", "xml": {"name": "Error"}},
+            description="Unable to complete request.",
+            examples=[
+                OpenApiExample(
+                    "invalid signature",
+                    {
+                        "status_code": 400,
+                        "code": "invalid",
+                        "title": "Invalid Request: Invalid Signature",
+                    },
+                )
+            ],
+        ),
+    },
+)
 @decorators.api_view(["POST"])
 @decorators.permission_classes([permissions.AllowAny])
 @decorators.renderer_classes([TemplateTwiMLRenderer])
 def inbound_sms(request):
+    """
+    Handle an inbound SMS message sent by Twilio.
+
+    The return value is TwilML Response XML that reports the error or an empty success
+    message.
+    """
     incr_if_enabled("phones_inbound_sms")
     _validate_twilio_request(request)
 
@@ -520,32 +715,49 @@ def inbound_sms(request):
         raise exceptions.ValidationError("Request missing From, To, Or Body.")
 
     relay_number, real_phone = _get_phone_objects(inbound_to)
+    if not real_phone.user.is_active:
+        return response.Response(
+            status=200,
+            template_name="twiml_empty_response.xml",
+        )
+
     _check_remaining(relay_number, "texts")
 
     if inbound_from == real_phone.number:
+        prepared = False
         try:
             relay_number, destination_number, body = _prepare_sms_reply(
                 relay_number, inbound_body
             )
-            client = twilio_client()
-            incr_if_enabled("phones_send_sms_reply")
-            client.messages.create(
-                from_=relay_number.number, body=body, to=destination_number
-            )
-            relay_number.remaining_texts -= 1
-            relay_number.texts_forwarded += 1
-            relay_number.save()
+            prepared = True
         except RelaySMSException as sms_exception:
+            _log_sms_exception("twilio", real_phone, sms_exception)
             user_error_message = _get_user_error_message(real_phone, sms_exception)
             twilio_client().messages.create(
                 from_=relay_number.number, body=user_error_message, to=real_phone.number
             )
+            if sms_exception.status_code >= 400:
+                raise
 
-            # Return 400 on critical exceptions
-            if sms_exception.critical:
-                raise exceptions.ValidationError(
-                    sms_exception.detail
-                ) from sms_exception
+        if prepared:
+            client = twilio_client()
+            incr_if_enabled("phones_send_sms_reply")
+            success = False
+            try:
+                client.messages.create(
+                    from_=relay_number.number, body=body, to=destination_number
+                )
+                success = True
+            except TwilioRestException as e:
+                logger.error(
+                    "Twilio failed to send reply",
+                    {"code": e.code, "http_status_code": e.status, "msg": e.msg},
+                )
+            if success:
+                relay_number.remaining_texts -= 1
+                relay_number.texts_forwarded += 1
+                relay_number.save()
+
         return response.Response(
             status=200,
             template_name="twiml_empty_response.xml",
@@ -565,24 +777,71 @@ def inbound_sms(request):
     app = twiml_app()
     incr_if_enabled("phones_outbound_sms")
     body = message_body(inbound_from, inbound_body)
-    client.messages.create(
-        from_=relay_number.number,
-        body=body,
-        status_callback=app.sms_status_callback,
-        to=real_phone.number,
-    )
-    relay_number.remaining_texts -= 1
-    relay_number.texts_forwarded += 1
-    relay_number.save()
+    result = "SUCCESS"
+    try:
+        client.messages.create(
+            from_=relay_number.number,
+            body=body,
+            status_callback=app.sms_status_callback,
+            to=real_phone.number,
+        )
+    except TwilioRestException as e:
+        if e.code == 21610:
+            # User has opted out with "STOP"
+            # TODO: Mark RealPhone as unsubscribed?
+            context = {"code": e.code, "http_status_code": e.status, "msg": e.msg}
+            context["fxa_id"] = real_phone.user.profile.metrics_fxa_id
+            info_logger.info("User has blocked their Relay number", context)
+            result = "BLOCKED"
+        else:
+            result = "FAILED"
+            logger.error(
+                "Twilio failed to forward message",
+                {"code": e.code, "http_status_code": e.status, "msg": e.msg},
+            )
+    if result == "SUCCESS":
+        relay_number.remaining_texts -= 1
+        relay_number.texts_forwarded += 1
+        relay_number.save()
+    elif result == "BLOCKED":
+        relay_number.texts_blocked += 1
+        relay_number.save()
+
     return response.Response(
         status=201,
         template_name="twiml_empty_response.xml",
     )
 
 
+@extend_schema(
+    tags=["phones: Inteliquent"],
+    request=OpenApiRequest(
+        IqInboundSmsSerializer,
+        examples=[
+            OpenApiExample(
+                "request",
+                {"to": "+13035556789", "from": "+14045556789", "text": "Hello!"},
+            )
+        ],
+    ),
+    parameters=[
+        OpenApiParameter(name="VerificationToken", required=True, location="header"),
+        OpenApiParameter(name="MessageId", required=True, location="header"),
+    ],
+    responses={
+        "200": OpenApiResponse(
+            description=(
+                "The message was forwarded, or the user is out of text messages."
+            )
+        ),
+        "401": OpenApiResponse(description="Invalid signature"),
+        "400": OpenApiResponse(description="Invalid request"),
+    },
+)
 @decorators.api_view(["POST"])
 @decorators.permission_classes([permissions.AllowAny])
 def inbound_sms_iq(request: Request) -> response.Response:
+    """Handle an inbound SMS message sent by Inteliquent."""
     incr_if_enabled("phones_inbound_sms_iq")
     _validate_iq_request(request)
 
@@ -593,12 +852,13 @@ def inbound_sms_iq(request: Request) -> response.Response:
         raise exceptions.ValidationError("Request missing from, to, or text.")
 
     from_num = phonenumbers.format_number(
-        phonenumbers.parse(inbound_from, "US"),
+        phonenumbers.parse(inbound_from, DEFAULT_REGION),
         phonenumbers.PhoneNumberFormat.E164,
     )
     single_num = inbound_to[0]
     relay_num = phonenumbers.format_number(
-        phonenumbers.parse(single_num, "US"), phonenumbers.PhoneNumberFormat.E164
+        phonenumbers.parse(single_num, DEFAULT_REGION),
+        phonenumbers.PhoneNumberFormat.E164,
     )
 
     relay_number, real_phone = _get_phone_objects(relay_num)
@@ -615,14 +875,12 @@ def inbound_sms_iq(request: Request) -> response.Response:
             relay_number.save()
             incr_if_enabled("phones_send_sms_reply_iq")
         except RelaySMSException as sms_exception:
+            _log_sms_exception("iq", real_phone, sms_exception)
             user_error_message = _get_user_error_message(real_phone, sms_exception)
             send_iq_sms(real_phone.number, relay_number.number, user_error_message)
+            if sms_exception.status_code >= 400:
+                raise
 
-            # Return 400 on critical exceptions
-            if sms_exception.critical:
-                raise exceptions.ValidationError(
-                    sms_exception.detail
-                ) from sms_exception
         return response.Response(
             status=200,
             template_name="twiml_empty_response.xml",
@@ -645,10 +903,93 @@ def inbound_sms_iq(request: Request) -> response.Response:
     return response.Response(status=200)
 
 
+@extend_schema(
+    tags=["phones: Twilio"],
+    parameters=[
+        OpenApiParameter(name="X-Twilio-Signature", required=True, location="header"),
+    ],
+    request=OpenApiRequest(
+        TwilioInboundCallSerializer,
+        examples=[
+            OpenApiExample(
+                "request",
+                {"Caller": "+13035556789", "Called": "+14045556789"},
+            )
+        ],
+    ),
+    responses={
+        "200": OpenApiResponse(
+            {
+                "type": "object",
+                "xml": {"name": "Response"},
+                "properties": {"say": {"type": "string"}},
+            },
+            description="The number is disabled.",
+            examples=[
+                OpenApiExample(
+                    "disabled", {"say": "Sorry, that number is not available."}
+                )
+            ],
+        ),
+        "201": OpenApiResponse(
+            {
+                "type": "object",
+                "xml": {"name": "Response"},
+                "properties": {
+                    "Dial": {
+                        "type": "object",
+                        "properties": {
+                            "callerId": {
+                                "type": "string",
+                                "xml": {"attribute": "true"},
+                            },
+                            "Number": {"type": "string"},
+                        },
+                    }
+                },
+            },
+            description="Connect the caller to the Relay user.",
+            examples=[
+                OpenApiExample(
+                    "success",
+                    {"Dial": {"callerId": "+13035556789", "Number": "+15025558642"}},
+                )
+            ],
+        ),
+        "400": OpenApiResponse(
+            {"type": "object", "xml": {"name": "Error"}},
+            description="Unable to complete request.",
+            examples=[
+                OpenApiExample(
+                    "invalid signature",
+                    {
+                        "status_code": 400,
+                        "code": "invalid",
+                        "title": "Invalid Request: Invalid Signature",
+                    },
+                ),
+                OpenApiExample(
+                    "out of call time for month",
+                    {
+                        "status_code": 400,
+                        "code": "invalid",
+                        "title": "Number Is Out Of Seconds.",
+                    },
+                ),
+            ],
+        ),
+    },
+)
 @decorators.api_view(["POST"])
 @decorators.permission_classes([permissions.AllowAny])
 @decorators.renderer_classes([TemplateTwiMLRenderer])
 def inbound_call(request):
+    """
+    Handle an inbound call request sent by Twilio.
+
+    The return value is TwilML Response XML that reports the error or instructs
+    Twilio to connect the callers.
+    """
     incr_if_enabled("phones_inbound_call")
     _validate_twilio_request(request)
     inbound_from = request.data.get("Caller", None)
@@ -657,6 +998,11 @@ def inbound_call(request):
         raise exceptions.ValidationError("Call data missing Caller or Called.")
 
     relay_number, real_phone = _get_phone_objects(inbound_to)
+    if not real_phone.user.is_active:
+        return response.Response(
+            status=200,
+            template_name="twiml_empty_response.xml",
+        )
 
     number_disabled = _check_disabled(relay_number, "calls")
     if number_disabled:
@@ -683,9 +1029,41 @@ def inbound_call(request):
     )
 
 
+@extend_schema(
+    tags=["phones: Twilio"],
+    request=OpenApiRequest(
+        TwilioVoiceStatusSerializer,
+        examples=[
+            OpenApiExample(
+                "Call is complete",
+                {
+                    "CallSid": "CA" + "x" * 32,
+                    "Called": "+14045556789",
+                    "CallStatus": "completed",
+                    "CallDuration": 127,
+                },
+            )
+        ],
+    ),
+    parameters=[
+        OpenApiParameter(name="X-Twilio-Signature", required=True, location="header"),
+    ],
+    responses={
+        "200": OpenApiResponse(description="Call status was processed."),
+        "400": OpenApiResponse(
+            description="Required parameters are incorrect or missing."
+        ),
+    },
+)
 @decorators.api_view(["POST"])
 @decorators.permission_classes([permissions.AllowAny])
 def voice_status(request):
+    """
+    Twilio callback for voice call status.
+
+    When the call is complete, the user's remaining monthly time is updated, and
+    the call is deleted from Twilio logs.
+    """
     incr_if_enabled("phones_voice_status")
     _validate_twilio_request(request)
     call_sid = request.data.get("CallSid", None)
@@ -705,7 +1083,7 @@ def voice_status(request):
         info_logger.info(
             "phone_limit_exceeded",
             extra={
-                "fxa_uid": relay_number.user.profile.fxa.uid,
+                "fxa_uid": relay_number.user.profile.metrics_fxa_id,
                 "call_duration_in_seconds": int(call_duration),
                 "relay_number_enabled": relay_number.enabled,
                 "remaining_seconds": relay_number.remaining_seconds,
@@ -717,9 +1095,35 @@ def voice_status(request):
     return response.Response(status=200)
 
 
+@extend_schema(
+    tags=["phones: Twilio"],
+    request=OpenApiRequest(
+        TwilioSmsStatusSerializer,
+        examples=[
+            OpenApiExample(
+                "SMS is delivered",
+                {"SmsStatus": "delivered", "MessageSid": "SM" + "x" * 32},
+            )
+        ],
+    ),
+    parameters=[
+        OpenApiParameter(name="X-Twilio-Signature", required=True, location="header"),
+    ],
+    responses={
+        "200": OpenApiResponse(description="SMS status was processed."),
+        "400": OpenApiResponse(
+            description="Required parameters are incorrect or missing."
+        ),
+    },
+)
 @decorators.api_view(["POST"])
 @decorators.permission_classes([permissions.AllowAny])
 def sms_status(request):
+    """
+    Twilio callback for SMS status.
+
+    When the message is delivered, this calls Twilio to delete the message from logs.
+    """
     _validate_twilio_request(request)
     sms_status = request.data.get("SmsStatus", None)
     message_sid = request.data.get("MessageSid", None)
@@ -737,9 +1141,21 @@ def sms_status(request):
 
 @decorators.permission_classes([permissions.IsAuthenticated, HasPhoneService])
 @extend_schema(
-    parameters=[OpenApiParameter(name="to", required=True, type=str)],
-    methods=["POST"],
-    responses={200: None},
+    tags=["phones: Outbound"],
+    request=OpenApiRequest(
+        OutboundCallSerializer,
+        examples=[OpenApiExample("request", {"to": "+13035556789"})],
+    ),
+    responses={
+        200: OpenApiResponse(description="Call initiated."),
+        400: OpenApiResponse(
+            description="Input error, or user does not have a Relay phone."
+        ),
+        401: OpenApiResponse(description="Authentication required."),
+        403: OpenApiResponse(
+            description="User does not have 'outbound_phone' waffle flag."
+        ),
+    },
 )
 @decorators.api_view(["POST"])
 def outbound_call(request):
@@ -752,7 +1168,7 @@ def outbound_call(request):
             {"detail": "Requires outbound_phone waffle flag."}, status=403
         )
     try:
-        real_phone = RealPhone.objects.get(user=request.user, verified=True)
+        real_phone = RealPhone.verified_objects.get_for_user(user=request.user)
     except RealPhone.DoesNotExist:
         return response.Response(
             {"detail": "Requires a verified real phone and phone mask."}, status=400
@@ -778,12 +1194,23 @@ def outbound_call(request):
 
 @decorators.permission_classes([permissions.IsAuthenticated, HasPhoneService])
 @extend_schema(
-    parameters=[
-        OpenApiParameter(name="body", required=True, type=str),
-        OpenApiParameter(name="destination", required=True, type=str),
-    ],
-    methods=["POST"],
-    responses={200: None},
+    tags=["phones: Outbound"],
+    request=OpenApiRequest(
+        OutboundSmsSerializer,
+        examples=[
+            OpenApiExample("request", {"body": "Hello!", "destination": "+13045554567"})
+        ],
+    ),
+    responses={
+        200: OpenApiResponse(description="Message sent."),
+        400: OpenApiResponse(
+            description="Input error, or user does not have a Relay phone."
+        ),
+        401: OpenApiResponse(description="Authentication required."),
+        403: OpenApiResponse(
+            description="User does not have 'outbound_phone' waffle flag."
+        ),
+    },
 )
 @decorators.api_view(["POST"])
 def outbound_sms(request):
@@ -827,21 +1254,39 @@ def outbound_sms(request):
 
 @decorators.permission_classes([permissions.IsAuthenticated, HasPhoneService])
 @extend_schema(
+    tags=["phones: Outbound"],
     parameters=[
         OpenApiParameter(
             name="with",
-            type=str,
-            required=False,
             description="filter to messages with the given E.164 number",
         ),
         OpenApiParameter(
             name="direction",
-            type=str,
-            required=False,
+            enum=["inbound", "outbound"],
             description="filter to inbound or outbound messages",
         ),
     ],
-    methods=["GET"],
+    responses={
+        "200": OpenApiResponse(
+            TwilioMessagesSerializer(many=True),
+            description="A list of the user's SMS messages.",
+            examples=[
+                OpenApiExample(
+                    "success",
+                    {
+                        "to": "+13035556789",
+                        "date_sent": datetime.now(UTC).isoformat(),
+                        "body": "Hello!",
+                        "from": "+14045556789",
+                    },
+                )
+            ],
+        ),
+        "400": OpenApiResponse(description="Unable to complete request."),
+        "403": OpenApiResponse(
+            description="Caller does not have 'outbound_phone' waffle flag."
+        ),
+    },
 )
 @decorators.api_view(["GET"])
 def list_messages(request):
@@ -912,133 +1357,11 @@ def _get_phone_objects(inbound_to):
     # Get RelayNumber and RealPhone
     try:
         relay_number = RelayNumber.objects.get(number=inbound_to)
-        real_phone = RealPhone.objects.get(user=relay_number.user, verified=True)
+        real_phone = RealPhone.verified_objects.get_for_user(relay_number.user)
     except ObjectDoesNotExist:
         raise exceptions.ValidationError("Could not find relay number.")
 
     return relay_number, real_phone
-
-
-class RelaySMSException(Exception):
-    """
-    Base class for exceptions when handling SMS messages.
-
-    Modeled after restframework.APIException, but without a status_code.
-
-    TODO MPP-3722: Refactor to a common base class with api.exceptions.RelayAPIException
-    """
-
-    critical: bool
-    default_code: str
-    default_detail: str | None = None
-    default_detail_template: str | None = None
-
-    def __init__(self, critical=False, *args, **kwargs):
-        self.critical = critical
-        assert (
-            self.default_detail is not None and self.default_detail_template is None
-        ) or (self.default_detail is None and self.default_detail_template is not None)
-        super().__init__(*args, **kwargs)
-
-    @property
-    def detail(self):
-        if self.default_detail:
-            return self.default_detail
-        else:
-            assert self.default_detail_template is not None
-            return self.default_detail_template.format(**self.error_context())
-
-    def get_codes(self):
-        return self.default_code
-
-    def error_context(self) -> ErrorContextType:
-        """Return context variables for client-side translation."""
-        return {}
-
-
-class NoPhoneLog(RelaySMSException):
-    default_code = "no_phone_log"
-    default_detail_template = (
-        "To reply, you must allow Firefox Relay to keep a log of your callers"
-        " and text senders. You can update this under “Caller and texts log” here:"
-        "{account_settings_url}."
-    )
-
-    def error_context(self) -> ErrorContextType:
-        return {
-            "account_settings_url": f"{settings.SITE_ORIGIN or ''}/accounts/settings/"
-        }
-
-
-class NoPreviousSender(RelaySMSException):
-    default_code = "no_previous_sender"
-    default_detail = (
-        "Message failed to send. You can only reply to phone numbers that have sent"
-        " you a text message."
-    )
-
-
-class ShortPrefixException(RelaySMSException):
-    """Base exception for short prefix exceptions"""
-
-    def __init__(self, short_prefix: str, *args, **kwargs):
-        self.short_prefix = short_prefix
-        super().__init__(*args, **kwargs)
-
-    def error_context(self) -> ErrorContextType:
-        return {"short_prefix": self.short_prefix}
-
-
-class FullNumberException(RelaySMSException):
-    """Base exception for full number exceptions"""
-
-    def __init__(self, full_number: str, *args, **kwargs):
-        self.full_number = full_number
-        super().__init__(*args, **kwargs)
-
-    def error_context(self) -> ErrorContextType:
-        return {"full_number": self.full_number}
-
-
-class ShortPrefixMatchesNoSenders(ShortPrefixException):
-    default_code = "short_prefix_matches_no_senders"
-    default_detail_template = (
-        "Message failed to send. There is no phone number in this thread ending"
-        " in {short_prefix}. Please check the number and try again."
-    )
-
-
-class FullNumberMatchesNoSenders(FullNumberException):
-    default_code = "full_number_matches_no_senders"
-    default_detail_template = (
-        "Message failed to send. There is no previous sender with the phone"
-        " number {full_number}. Please check the number and try again."
-    )
-
-
-class MultipleNumberMatches(ShortPrefixException):
-    default_code = "multiple_number_matches"
-    default_detail_template = (
-        "Message failed to send. There is more than one phone number in this"
-        " thread ending in {short_prefix}. To retry, start your message with"
-        " the complete number."
-    )
-
-
-class NoBodyAfterShortPrefix(ShortPrefixException):
-    default_code = "no_body_after_short_prefix"
-    default_detail_template = (
-        "Message failed to send. Please include a message after the sender identifier"
-        " {short_prefix}."
-    )
-
-
-class NoBodyAfterFullNumber(FullNumberException):
-    default_code = "no_body_after_full_number"
-    default_detail_template = (
-        "Message failed to send. Please include a message after the phone number"
-        " {full_number}."
-    )
 
 
 def _prepare_sms_reply(
@@ -1047,7 +1370,7 @@ def _prepare_sms_reply(
     incr_if_enabled("phones_handle_sms_reply")
     if not relay_number.storing_phone_log:
         # We do not store user's contacts in our database
-        raise NoPhoneLog(critical=True)
+        raise NoPhoneLog()
 
     match = _match_senders_by_prefix(relay_number, inbound_body)
 
@@ -1057,14 +1380,16 @@ def _prepare_sms_reply(
     if match and not match.contacts and match.match_type == "full":
         raise FullNumberMatchesNoSenders(full_number=match.detected)
     if match and len(match.contacts) > 1:
-        assert match.match_type == "short"
+        if not match.match_type == "short":
+            raise ValueError("match.match_type must be 'short'.")
         raise MultipleNumberMatches(short_prefix=match.detected)
 
     # Determine the destination number
     destination_number: str | None = None
     if match:
         # Use the sender matched by the prefix
-        assert len(match.contacts) == 1
+        if not len(match.contacts) == 1:
+            raise ValueError("len(match.contacts) must be 1.")
         destination_number = match.contacts[0].inbound_number
     else:
         # No prefix, default to last sender if any
@@ -1073,7 +1398,7 @@ def _prepare_sms_reply(
 
     # Fail if no last sender
     if destination_number is None:
-        raise NoPreviousSender(critical=True)
+        raise NoPreviousSender()
 
     # Determine the message body
     if match:
@@ -1138,7 +1463,11 @@ def _match_senders_by_prefix(relay_number: RelayNumber, text: str) -> MatchData 
         contacts_by_number: dict[str, InboundContact] = {}
         for contact in contacts:
             # TODO: don't default to US when we support other regions
-            pn = phonenumbers.parse(contact.inbound_number, "US")
+            try:
+                pn = phonenumbers.parse(contact.inbound_number, DEFAULT_REGION)
+            except phonenumbers.phonenumberutil.NumberParseException:
+                # Invalid number like '1', skip it
+                continue
             e164 = phonenumbers.format_number(pn, phonenumbers.PhoneNumberFormat.E164)
             if e164 not in contacts_by_number:
                 contacts_by_number[e164] = contact
@@ -1288,7 +1617,7 @@ def _check_and_update_contact(inbound_contact, contact_type, relay_number):
         relay_number.save()
         raise exceptions.ValidationError(f"Number is not accepting {contact_type}.")
 
-    inbound_contact.last_inbound_date = datetime.now(timezone.utc)
+    inbound_contact.last_inbound_date = datetime.now(UTC)
     singular_contact_type = contact_type[:-1]  # strip trailing "s"
     inbound_contact.last_inbound_type = singular_contact_type
     attr = f"num_{contact_type}"
@@ -1338,7 +1667,7 @@ def _validate_iq_request(request: Request) -> None:
     token = request._request.headers["verificationToken"]
 
     if mac != token:
-        raise exceptions.AuthenticationFailed("verficiationToken != computed sha256")
+        raise exceptions.AuthenticationFailed("verificationToken != computed sha256")
 
 
 def convert_twilio_messages_to_dict(twilio_messages):

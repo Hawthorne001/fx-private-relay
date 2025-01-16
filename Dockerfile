@@ -1,4 +1,4 @@
-FROM python:3.11.8
+FROM python:3.11.10
 
 ARG CIRCLE_BRANCH
 ARG CIRCLE_SHA1
@@ -38,4 +38,4 @@ RUN PHONES_ENABLED=True \
 
 ENTRYPOINT ["/app/.local/bin/gunicorn"]
 
-CMD ["--config", "gunicorn.conf", "privaterelay.wsgi:application"]
+CMD ["--config", "gunicorn.conf.py", "privaterelay.wsgi:application"]

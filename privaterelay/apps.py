@@ -1,16 +1,20 @@
 import base64
 import json
-from pathlib import Path
-from typing import Any
-import requests
 import os
+from pathlib import Path
+from typing import TYPE_CHECKING, Any
 
 from django.apps import AppConfig
 from django.conf import settings
 from django.utils.functional import cached_property
 
+import requests
 
 ROOT_DIR = os.path.abspath(os.curdir)
+
+
+if TYPE_CHECKING:
+    from allauth.socialaccount.models import SocialApp
 
 
 def get_profiler_startup_data() -> tuple[str | None, str | None]:
@@ -31,7 +35,9 @@ def get_profiler_startup_data() -> tuple[str | None, str | None]:
 
 
 def write_gcp_key_json_file(gcp_key_json_path: Path) -> None:
-    # create the gcp key json file from contents of GOOGLE_CLOUD_PROFILER_CREDENTIALS_B64
+    """
+    Create the gcp key json file from contents of GOOGLE_CLOUD_PROFILER_CREDENTIALS_B64
+    """
     google_app_creds = base64.b64decode(settings.GOOGLE_CLOUD_PROFILER_CREDENTIALS_B64)
     if not google_app_creds == b"":
         with open(gcp_key_json_path, "w+") as gcp_key_file:
@@ -48,7 +54,7 @@ class PrivateRelayConfig(AppConfig):
         ):
             # Set up Google Cloud Profiler
             service, version = get_profiler_startup_data()
-            if service != None:
+            if service is not None:
                 gcp_key_json_path = Path(settings.GOOGLE_APPLICATION_CREDENTIALS)
                 if not gcp_key_json_path.exists():
                     write_gcp_key_json_file(gcp_key_json_path)
@@ -73,21 +79,27 @@ class PrivateRelayConfig(AppConfig):
                         f" with key file: {gcp_key_json_path}"
                     )
 
-        import privaterelay.signals
-
-        assert privaterelay.signals  # Suppress "imported but unused" warnings
+        import privaterelay.signals  # noqa: F401 (imported but unused warning)
 
         try:
             del self.fxa_verifying_keys  # Clear cache
+            del self.fxa_social_app  # Clear cache
         except AttributeError:
             pass
 
     @cached_property
     def fxa_verifying_keys(self) -> list[dict[str, Any]]:
         resp = requests.get(
-            "%s/jwks" % settings.SOCIALACCOUNT_PROVIDERS["fxa"]["OAUTH_ENDPOINT"]
+            "{}/jwks".format(settings.SOCIALACCOUNT_PROVIDERS["fxa"]["OAUTH_ENDPOINT"]),
+            timeout=10,
         )
         if resp.status_code == 200:
             keys: list[dict[str, Any]] = resp.json()["keys"]
             return keys
         return []
+
+    @cached_property
+    def fxa_social_app(self) -> "SocialApp":
+        from allauth.socialaccount.models import SocialApp
+
+        return SocialApp.objects.get(provider="fxa")

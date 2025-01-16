@@ -1,28 +1,24 @@
-from dataclasses import dataclass
-from datetime import datetime, timezone
-from typing import Literal
-from collections.abc import Iterator
-from unittest.mock import Mock, patch, call
 import re
-
-from twilio.request_validator import RequestValidator
-from twilio.rest import Client
+from collections.abc import Iterator
+from dataclasses import dataclass
+from datetime import UTC, datetime
+from typing import Literal
+from unittest.mock import Mock, call, patch
 
 from django.conf import settings
 from django.contrib.auth.models import User
 from django.test.utils import override_settings
 
+import pytest
 from model_bakery import baker
 from rest_framework.test import APIClient
 from twilio.base.exceptions import TwilioRestException
+from twilio.request_validator import RequestValidator
+from twilio.rest import Client
 from waffle.testutils import override_flag
-import pytest
-
-from emails.models import Profile
-
 
 if settings.PHONES_ENABLED:
-    from api.views.phones import _match_by_prefix, MatchByPrefix
+    from api.views.phones import MatchByPrefix, _match_by_prefix
     from phones.models import InboundContact, RealPhone, RelayNumber
     from phones.tests.models_tests import make_phone_test_user
 
@@ -98,55 +94,55 @@ def user_with_sms_activity(outbound_phone_user, mocked_twilio_client):
     InboundContact.objects.create(
         relay_number=relay_number,
         inbound_number="+13015550001",
-        last_inbound_date=datetime(2023, 3, 1, 12, 5, tzinfo=timezone.utc),
+        last_inbound_date=datetime(2023, 3, 1, 12, 5, tzinfo=UTC),
         last_inbound_type="text",
-        last_text_date=datetime(2023, 3, 1, 12, 5, tzinfo=timezone.utc),
+        last_text_date=datetime(2023, 3, 1, 12, 5, tzinfo=UTC),
     )
     # Second SMS contact
     InboundContact.objects.create(
         relay_number=relay_number,
         inbound_number="+13015550002",
-        last_inbound_date=datetime(2023, 3, 2, 13, 5, tzinfo=timezone.utc),
+        last_inbound_date=datetime(2023, 3, 2, 13, 5, tzinfo=UTC),
         last_inbound_type="text",
-        last_text_date=datetime(2023, 3, 2, 13, 5, tzinfo=timezone.utc),
+        last_text_date=datetime(2023, 3, 2, 13, 5, tzinfo=UTC),
     )
     # Voice contact
     InboundContact.objects.create(
         relay_number=relay_number,
         inbound_number="+13015550003",
-        last_inbound_date=datetime(2023, 3, 3, 8, 30, tzinfo=timezone.utc),
+        last_inbound_date=datetime(2023, 3, 3, 8, 30, tzinfo=UTC),
         last_inbound_type="call",
-        last_call_date=datetime(2023, 3, 3, 8, 30, tzinfo=timezone.utc),
+        last_call_date=datetime(2023, 3, 3, 8, 30, tzinfo=UTC),
     )
     twilio_messages = [
         MockTwilioMessage(
             from_="+13015550001",
             to=relay_number.number,
-            date_sent=datetime(2023, 3, 1, 12, 0, tzinfo=timezone.utc),
+            date_sent=datetime(2023, 3, 1, 12, 0, tzinfo=UTC),
             body="Send Y to confirm appointment",
         ),
         MockTwilioMessage(
             from_=relay_number.number,
             to="+13015550001",
-            date_sent=datetime(2023, 3, 1, 12, 5, tzinfo=timezone.utc),
+            date_sent=datetime(2023, 3, 1, 12, 5, tzinfo=UTC),
             body="Y",
         ),
         MockTwilioMessage(
             from_="+13015550002",
             to=relay_number.number,
-            date_sent=datetime(2023, 3, 2, 13, 0, tzinfo=timezone.utc),
+            date_sent=datetime(2023, 3, 2, 13, 0, tzinfo=UTC),
             body="Donate $100 to Senator Smith?",
         ),
         MockTwilioMessage(
             from_=relay_number.number,
             to="+13015550002",
-            date_sent=datetime(2023, 3, 2, 13, 5, tzinfo=timezone.utc),
+            date_sent=datetime(2023, 3, 2, 13, 5, tzinfo=UTC),
             body="STOP STOP STOP",
         ),
         MockTwilioMessage(
             from_=relay_number.number,
             to="+13015550004",
-            date_sent=datetime(2023, 3, 4, 20, 55, tzinfo=timezone.utc),
+            date_sent=datetime(2023, 3, 4, 20, 55, tzinfo=UTC),
             body="U Up?",
         ),
     ]
@@ -183,10 +179,11 @@ def mocked_twilio_client():
     ) as mock_twilio_client:
         mock_twilio_client._pn_return = Mock()
 
-        def mock_phone_lookup(number: str | None = None):
+        def mock_phone_lookup(number: str | None = None) -> Mock:
             """Return number details based on the number passed to phone_numbers()"""
             if number is None:
                 # Allow mocked_twilio_client.lookups.v1.phone_numbers().fetch to work
+                assert isinstance(mock_twilio_client._pn_return, Mock)
                 return mock_twilio_client._pn_return
             match = re_e164.match(number)
             assert match
@@ -289,8 +286,8 @@ def test_realphone_post_valid_e164_number_in_unsupported_country(
     response = client.post(path, data, format="json", HTTP_X_CLIENT_REGION="nl")
     assert response.status_code == 400
     expected = [
-        "Relay Phone is currently only available for these country codes: ['CA', 'US']."
-        " Your phone number country code is: 'NL'."
+        "Relay Phone is currently only available for these country codes:"
+        " ['CA', 'PR', 'US']. Your phone number country code is: 'NL'."
     ]
     assert response.json() == expected
 
@@ -848,6 +845,28 @@ def test_inbound_sms_valid_twilio_signature_unknown_number(
     assert "Could Not Find Relay Number." in response.data[0].title()
 
 
+def test_inbound_sms_valid_twilio_signature_good_data_deactivated_user(
+    phone_user, mocked_twilio_client
+):
+    phone_user.is_active = False
+    phone_user.save()
+    _make_real_phone(phone_user, verified=True)
+    relay_number = _make_relay_number(phone_user)
+    pre_inbound_remaining_texts = relay_number.remaining_texts
+    mocked_twilio_client.reset_mock()
+
+    client = APIClient()
+    path = "/api/v1/inbound_sms"
+    data = {"From": "+15556660000", "To": relay_number.number, "Body": "test body"}
+    response = client.post(path, data, HTTP_X_TWILIO_SIGNATURE="valid")
+
+    assert response.status_code == 200
+    mocked_twilio_client.messages.create.assert_not_called()
+    relay_number.refresh_from_db()
+    assert relay_number.texts_forwarded == 0
+    assert relay_number.remaining_texts == pre_inbound_remaining_texts
+
+
 def test_inbound_sms_valid_twilio_signature_good_data(phone_user, mocked_twilio_client):
     real_phone = _make_real_phone(phone_user, verified=True)
     relay_number = _make_relay_number(phone_user)
@@ -934,11 +953,10 @@ def test_inbound_sms_reply_with_no_remaining_texts(phone_user, mocked_twilio_cli
 
 
 def test_inbound_sms_valid_twilio_signature_no_phone_log(
-    phone_user, mocked_twilio_client
-):
-    profile = Profile.objects.get(user=phone_user)
-    profile.store_phone_log = False
-    profile.save()
+    phone_user: User, mocked_twilio_client: Mock
+) -> None:
+    phone_user.profile.store_phone_log = False
+    phone_user.profile.save()
     _make_real_phone(phone_user, verified=True)
     relay_number = _make_relay_number(phone_user, enabled=True)
     inbound_number = "+15556660000"
@@ -958,11 +976,10 @@ def test_inbound_sms_valid_twilio_signature_no_phone_log(
 
 
 def test_inbound_sms_valid_twilio_signature_blocked_contact(
-    phone_user, mocked_twilio_client
-):
-    profile = Profile.objects.get(user=phone_user)
-    profile.store_phone_log = True
-    profile.save()
+    phone_user: User, mocked_twilio_client: Mock
+) -> None:
+    phone_user.profile.store_phone_log = True
+    phone_user.profile.save()
     _make_real_phone(phone_user, verified=True)
     relay_number = _make_relay_number(phone_user, enabled=True)
     inbound_number = "+15556660000"
@@ -1008,13 +1025,96 @@ def test_inbound_sms_valid_twilio_signature_blocked_contact(
     assert inbound_contact.last_inbound_date == pre_block_contact_date
 
 
-def test_inbound_sms_reply_not_storing_phone_log(phone_user, mocked_twilio_client):
+def test_inbound_sms_to_unsubscribed_contact(
+    phone_user: User, mocked_twilio_client: Mock, caplog: pytest.LogCaptureFixture
+) -> None:
+    phone_user.profile.store_phone_log = True
+    phone_user.profile.save()
+    _make_real_phone(phone_user, verified=True)
+    relay_number = _make_relay_number(phone_user, enabled=True)
+    inbound_number = "+15556660000"
+    inbound_contact = InboundContact.objects.create(
+        relay_number=relay_number, inbound_number=inbound_number
+    )
+    mocked_twilio_client.reset_mock()
+    mocked_twilio_client.messages.create.side_effect = TwilioRestException(
+        uri="/2010-04-01/Accounts/{AccountSid}/Messages.json",
+        msg=("Unable to create record:" " Attempt to send to unsubscribed recipient"),
+        method="POST",
+        status=400,
+        code=21610,
+    )
+
+    client = APIClient()
+    path = "/api/v1/inbound_sms"
+    data = {"From": inbound_number, "To": relay_number.number, "Body": "test body"}
+    response = client.post(path, data, HTTP_X_TWILIO_SIGNATURE="valid")
+
+    assert response.status_code == 201
+    decoded_content = response.content.decode()
+    assert decoded_content.startswith("<?xml")
+    assert "<Response/>" in decoded_content
+    mocked_twilio_client.messages.create.assert_called_once()
+    inbound_contact.refresh_from_db()
+    assert inbound_contact.num_texts == 1
+    assert inbound_contact.last_inbound_type == "text"
+    relay_number.refresh_from_db()
+    assert relay_number.texts_forwarded == 0
+    assert relay_number.texts_blocked == 1
+    assert (
+        "eventsinfo",
+        20,
+        "User has blocked their Relay number",
+    ) in caplog.record_tuples
+
+
+def test_inbound_sms_message_too_long(
+    phone_user: User, mocked_twilio_client: Mock, caplog: pytest.LogCaptureFixture
+) -> None:
+    phone_user.profile.store_phone_log = True
+    phone_user.profile.save()
+    _make_real_phone(phone_user, verified=True)
+    relay_number = _make_relay_number(phone_user, enabled=True)
+    inbound_number = "+15556660000"
+    inbound_contact = InboundContact.objects.create(
+        relay_number=relay_number, inbound_number=inbound_number
+    )
+    mocked_twilio_client.reset_mock()
+    mocked_twilio_client.messages.create.side_effect = TwilioRestException(
+        uri="/2010-04-01/Accounts/{AccountSid}/Messages.json",
+        msg=("Unable to create record:" " Message body is too long"),
+        method="POST",
+        status=400,
+        code=21602,
+    )
+
+    client = APIClient()
+    path = "/api/v1/inbound_sms"
+    data = {"From": inbound_number, "To": relay_number.number, "Body": "test body"}
+    response = client.post(path, data, HTTP_X_TWILIO_SIGNATURE="valid")
+
+    assert response.status_code == 201
+    decoded_content = response.content.decode()
+    assert decoded_content.startswith("<?xml")
+    assert "<Response/>" in decoded_content
+    mocked_twilio_client.messages.create.assert_called_once()
+    inbound_contact.refresh_from_db()
+    assert inbound_contact.num_texts == 1
+    assert inbound_contact.last_inbound_type == "text"
+    relay_number.refresh_from_db()
+    assert relay_number.texts_forwarded == 0
+    assert relay_number.texts_blocked == 0
+    assert ("events", 40, "Twilio failed to forward message") in caplog.record_tuples
+
+
+def test_inbound_sms_reply_not_storing_phone_log(
+    phone_user: User, mocked_twilio_client: Mock
+) -> None:
     real_phone = _make_real_phone(phone_user, verified=True)
     relay_number = _make_relay_number(phone_user, enabled=True)
     mocked_twilio_client.reset_mock()
-    profile = Profile.objects.get(user=phone_user)
-    profile.store_phone_log = False
-    profile.save()
+    phone_user.profile.store_phone_log = False
+    phone_user.profile.save()
 
     client = APIClient()
     path = "/api/v1/inbound_sms"
@@ -1023,7 +1123,7 @@ def test_inbound_sms_reply_not_storing_phone_log(phone_user, mocked_twilio_clien
 
     assert response.status_code == 400
     decoded_content = response.content.decode()
-    assert "To Reply, You Must Allow " in decoded_content
+    assert "The reply feature requires " in decoded_content
     mocked_twilio_client.messages.create.assert_called_once()
     call_kwargs = mocked_twilio_client.messages.create.call_args.kwargs
     assert call_kwargs["to"] == real_phone.number
@@ -1044,7 +1144,7 @@ def test_inbound_sms_reply_no_previous_sender(phone_user, mocked_twilio_client):
 
     assert response.status_code == 400
     decoded_content = response.content.decode()
-    assert "You Can Only Reply To Phone Numbers" in decoded_content
+    assert "You can only reply to phone numbers " in decoded_content
     mocked_twilio_client.messages.create.assert_called_once()
     call_kwargs = mocked_twilio_client.messages.create.call_args.kwargs
     assert call_kwargs["to"] == real_phone.number
@@ -1059,7 +1159,7 @@ def test_inbound_sms_reply(phone_user: User, mocked_twilio_client: Client) -> No
     real_phone = _make_real_phone(phone_user, verified=True)
     relay_number = _make_relay_number(phone_user, enabled=True)
 
-    # Setup: Recieve a text from a contact
+    # Setup: Receive a text from a contact
     client = APIClient()
     path = "/api/v1/inbound_sms"
     contact_number = "+15556660000"
@@ -1091,7 +1191,7 @@ def test_inbound_sms_reply_to_first_caller(
     real_phone = _make_real_phone(phone_user, verified=True)
     relay_number = _make_relay_number(phone_user, enabled=True)
 
-    # Setup: Recieve a text from a contact
+    # Setup: Receive a text from a contact
     client = APIClient()
     sms_path = "/api/v1/inbound_sms"
     contact_number = "+15556660000"
@@ -1101,7 +1201,7 @@ def test_inbound_sms_reply_to_first_caller(
     relay_number.refresh_from_db()
     assert relay_number.texts_forwarded == 1
 
-    # Setup: Recieve a call from the same contact
+    # Setup: Receive a call from the same contact
     voice_path = "/api/v1/inbound_call"
     data = {"Caller": contact_number, "Called": relay_number.number}
     response = client.post(voice_path, data, HTTP_X_TWILIO_SIGNATURE="valid")
@@ -1131,7 +1231,7 @@ def test_inbound_sms_reply_to_caller(
     real_phone = _make_real_phone(phone_user, verified=True)
     relay_number = _make_relay_number(phone_user, enabled=True)
 
-    # Setup: Recieve a text from first contact
+    # Setup: Receive a text from first contact
     client = APIClient()
     sms_path = "/api/v1/inbound_sms"
     contact1_number = "+13015550000"
@@ -1145,7 +1245,7 @@ def test_inbound_sms_reply_to_caller(
     relay_number.refresh_from_db()
     assert relay_number.texts_forwarded == 1
 
-    # Setup: Recieve a text from second contact
+    # Setup: Receive a text from second contact
     contact2_number = "+13025550001"
     data = {
         "From": contact2_number,
@@ -1157,7 +1257,7 @@ def test_inbound_sms_reply_to_caller(
     relay_number.refresh_from_db()
     assert relay_number.texts_forwarded == 2
 
-    # Setup: Recieve a call from second contact
+    # Setup: Receive a call from second contact
     voice_path = "/api/v1/inbound_call"
     data = {"Caller": contact2_number, "Called": relay_number.number}
     response = client.post(voice_path, data, HTTP_X_TWILIO_SIGNATURE="valid")
@@ -1215,7 +1315,9 @@ def test_inbound_sms_reply_pre_transition(
     assert relay_number.texts_forwarded == 1
 
 
-def test_inbound_sms_reply_no_multi_replies(phone_user, mocked_twilio_client) -> None:
+def test_inbound_sms_reply_no_multi_replies(
+    phone_user: User, mocked_twilio_client: Mock
+) -> None:
     """A user without multi_replies flag cannot use prefixes."""
     real_phone = _make_real_phone(phone_user, verified=True)
     relay_number = _make_relay_number(phone_user, enabled=True)
@@ -1420,6 +1522,35 @@ def test_inbound_sms_reply_full_prefix_never_text(
     assert relay_number.texts_forwarded == multi_reply.old_texts_forwarded + 1
 
 
+def test_inbound_sms_reply_invalid_contact_does_not_break_prefix(
+    multi_reply: MultiReplyFixture,
+) -> None:
+    """A previous contact with an invalid phone number is ignored."""
+    relay_number = multi_reply.relay_number
+    InboundContact.objects.create(
+        relay_number=relay_number,
+        inbound_number="+0000",
+    )
+    data = {
+        "From": multi_reply.real_phone.number,
+        "To": relay_number.number,
+        "Body": "0000: test reply",
+    }
+    response = APIClient().post(
+        "/api/v1/inbound_sms", data, HTTP_X_TWILIO_SIGNATURE="valid"
+    )
+
+    assert response.status_code == 200
+    msg_create_api = multi_reply.mocked_twilio_client.messages.create
+    msg_create_api.assert_called_once()
+    call_kwargs = msg_create_api.call_args.kwargs
+    assert call_kwargs["to"] == "+13015550000"
+    assert call_kwargs["from_"] == relay_number.number
+    assert call_kwargs["body"] == "test reply"
+    relay_number.refresh_from_db()
+    assert relay_number.texts_forwarded == multi_reply.old_texts_forwarded + 1
+
+
 _sms_reply_error_test_cases = {
     "short prefix with multiple matching contacts": (
         "0001 test reply to ambiguous number",
@@ -1511,6 +1642,86 @@ def test_inbound_sms_reply_no_prefix_last_sender(
     assert call_kwargs["body"] == data["Body"]
     relay_number.refresh_from_db()
     assert relay_number.texts_forwarded == multi_reply.old_texts_forwarded + 1
+
+
+def test_inbound_sms_reply_to_unsubscribed(
+    phone_user: User, mocked_twilio_client: Client, caplog: pytest.LogCaptureFixture
+) -> None:
+    real_phone = _make_real_phone(phone_user, verified=True)
+    relay_number = _make_relay_number(phone_user, enabled=True)
+
+    # Setup: Receive a text from a contact
+    client = APIClient()
+    path = "/api/v1/inbound_sms"
+    contact_number = "+15556660000"
+    data = {"From": contact_number, "To": relay_number.number, "Body": "test body"}
+    response = client.post(path, data, HTTP_X_TWILIO_SIGNATURE="valid")
+    assert response.status_code == 201
+    relay_number.refresh_from_db()
+    assert relay_number.texts_forwarded == 1
+
+    # Test: Send text reply to the contact, get exception
+    mocked_twilio_client.reset_mock()
+    mocked_twilio_client.messages.create.side_effect = TwilioRestException(
+        uri="/2010-04-01/Accounts/{AccountSid}/Messages.json",
+        msg=("Unable to create record:" " Attempt to send to unsubscribed recipient"),
+        method="POST",
+        status=400,
+        code=21610,
+    )
+
+    data = {"From": real_phone.number, "To": relay_number.number, "Body": "test reply"}
+    response = client.post(path, data, HTTP_X_TWILIO_SIGNATURE="valid")
+
+    assert response.status_code == 200
+    mocked_twilio_client.messages.create.assert_called_once()
+    call_kwargs = mocked_twilio_client.messages.create.call_args.kwargs
+    assert call_kwargs["to"] == contact_number
+    assert call_kwargs["from_"] == relay_number.number
+    assert call_kwargs["body"] == "test reply"
+    relay_number.refresh_from_db()
+    assert relay_number.texts_forwarded == 1
+    assert ("events", 40, "Twilio failed to send reply") in caplog.record_tuples
+
+
+def test_inbound_sms_reply_too_long(
+    phone_user: User, mocked_twilio_client: Client, caplog: pytest.LogCaptureFixture
+) -> None:
+    real_phone = _make_real_phone(phone_user, verified=True)
+    relay_number = _make_relay_number(phone_user, enabled=True)
+
+    # Setup: Receive a text from a contact
+    client = APIClient()
+    path = "/api/v1/inbound_sms"
+    contact_number = "+15556660000"
+    data = {"From": contact_number, "To": relay_number.number, "Body": "test body"}
+    response = client.post(path, data, HTTP_X_TWILIO_SIGNATURE="valid")
+    assert response.status_code == 201
+    relay_number.refresh_from_db()
+    assert relay_number.texts_forwarded == 1
+
+    # Test: Send text reply to the contact, get exception
+    mocked_twilio_client.reset_mock()
+    mocked_twilio_client.messages.create.side_effect = TwilioRestException(
+        uri="/2010-04-01/Accounts/{AccountSid}/Messages.json",
+        msg="Unable to create record: Message body is too long",
+        method="POST",
+        status=400,
+        code=21602,
+    )
+
+    data = {"From": real_phone.number, "To": relay_number.number, "Body": "test reply"}
+    response = client.post(path, data, HTTP_X_TWILIO_SIGNATURE="valid")
+
+    assert response.status_code == 200
+    mocked_twilio_client.messages.create.assert_called_once()
+    call_kwargs = mocked_twilio_client.messages.create.call_args.kwargs
+    assert call_kwargs["to"] == contact_number
+    assert call_kwargs["from_"] == relay_number.number
+    assert call_kwargs["body"] == "test reply"
+    relay_number.refresh_from_db()
+    assert relay_number.texts_forwarded == 1
+    assert ("events", 40, "Twilio failed to send reply") in caplog.record_tuples
 
 
 _match_by_prefix_candidates = {
@@ -1779,7 +1990,7 @@ _match_by_prefix_no_match_tests: dict[str, str] = {
     _match_by_prefix_no_match_tests.values(),
     ids=list(_match_by_prefix_no_match_tests.keys()),
 )
-def test_match_by_prefix_no_match(text: str):
+def test_match_by_prefix_no_match(text: str) -> None:
     match = _match_by_prefix(text, _match_by_prefix_candidates)
     assert match is None
 
@@ -1851,6 +2062,33 @@ def test_inbound_call_valid_twilio_signature_unknown_number(
 
     assert response.status_code == 400
     assert "Could Not Find Relay Number." in response.data[0].title()
+
+
+def test_inbound_call_valid_twilio_signature_good_data_deactivated_user(
+    phone_user, mocked_twilio_client
+):
+    _make_real_phone(phone_user, verified=True)
+    relay_number = _make_relay_number(phone_user, enabled=True)
+    phone_user.is_active = False
+    phone_user.save()
+    pre_call_calls_forwarded = relay_number.calls_forwarded
+    caller_number = "+15556660000"
+    mocked_twilio_client.reset_mock()
+
+    client = APIClient()
+    path = "/api/v1/inbound_call"
+    data = {"Caller": caller_number, "Called": relay_number.number}
+    response = client.post(path, data, HTTP_X_TWILIO_SIGNATURE="valid")
+
+    assert response.status_code == 200
+    decoded_content = response.content.decode()
+    assert "<Response/>" in decoded_content
+    relay_number.refresh_from_db()
+    assert relay_number.calls_forwarded == pre_call_calls_forwarded
+    with pytest.raises(InboundContact.DoesNotExist):
+        InboundContact.objects.get(
+            relay_number=relay_number, inbound_number=caller_number
+        )
 
 
 def test_inbound_call_valid_twilio_signature_good_data(

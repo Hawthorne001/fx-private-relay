@@ -1,18 +1,18 @@
-from datetime import datetime, timezone, timedelta
+from datetime import UTC, datetime, timedelta
 from io import StringIO
 from unittest.mock import patch
 
-from django.contrib.auth.models import User
-from django.core.management import call_command, CommandError
 from django.conf import settings
+from django.contrib.auth.models import User
+from django.core.management import CommandError, call_command
 
+import pytest
 from model_bakery import baker
 from pytest_django.fixtures import SettingsWrapper
-import pytest
 
 if settings.PHONES_ENABLED:
-    from .models_tests import make_phone_test_user
     from ..models import InboundContact, RealPhone, RelayNumber
+    from .models_tests import make_phone_test_user
 
 pytestmark = pytest.mark.skipif(
     not settings.PHONES_ENABLED, reason="PHONES_ENABLED is False"
@@ -31,7 +31,7 @@ def test_settings(settings: SettingsWrapper) -> SettingsWrapper:
 def phone_user(db: None, test_settings: SettingsWrapper) -> User:
     """Return a Relay user with phone setup and phone usage."""
     # Create the user
-    now = datetime.now(tz=timezone.utc)
+    now = datetime.now(tz=UTC)
     phone_user = make_phone_test_user()
     phone_user.profile.date_subscribed = now - timedelta(days=15)
     phone_user.profile.save()
@@ -146,6 +146,55 @@ Found a matching user:
 * FxA ID: {phone_user.profile.fxa.uid}
 * User ID: {phone_user.id}
 * Email: phone_user@example.com
+* Real Phone: +12005550123
+* Relay Phone: <NO RELAY PHONE>
+* Inbound Contacts: 0
+
+Deleted user's phone data.
+"""
+    assert stdout.getvalue() == expected_stdout
+
+    phone_user.refresh_from_db()
+    assert phone_user.profile.has_phone
+    assert not RealPhone.objects.filter(user=phone_user).exists()
+
+
+@pytest.mark.django_db
+def test_two_real_phones() -> None:
+    # Add user
+    now = datetime.now(tz=UTC)
+    phone_user = make_phone_test_user()
+    phone_user.profile.date_subscribed = now - timedelta(days=15)
+    phone_user.profile.save()
+
+    # Add unconfirmed real phone
+    baker.make(
+        RealPhone,
+        user=phone_user,
+        number="+12005550122",
+        verified=False,
+    )
+
+    # Add confirmed real phone
+    baker.make(
+        RealPhone,
+        user=phone_user,
+        number="+12005550123",
+        verification_sent_date=now - timedelta(days=14),
+        verified=True,
+    )
+
+    stdout = StringIO()
+    assert (fxa := phone_user.profile.fxa)
+    call_command(THE_COMMAND, fxa.uid, "--force", stdout=stdout)
+
+    expected_stdout = f"""\
+Found a matching user:
+
+* FxA ID: {phone_user.profile.fxa.uid}
+* User ID: {phone_user.id}
+* Email: phone_user@example.com
+* Real Phone: +12005550122
 * Real Phone: +12005550123
 * Relay Phone: <NO RELAY PHONE>
 * Inbound Contacts: 0

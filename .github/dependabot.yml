@@ -17,6 +17,11 @@ updates:
           - "babel-jest"
           - "jest"
           - "jest-environment-jsdom"
+      nextjs:
+        patterns:
+          - "eslint-config-next"
+          - "next"
+          - "@next/*"
       react:
         patterns:
           - "react"
@@ -50,6 +55,9 @@ updates:
           - "botocore"
           - "botocore-stubs"
           - "mypy-boto3-ses"
+          - "mypy-boto3-sns"
+          - "mypy-boto3-sqs"
+          - "mypy-boto3-s3"
       testing-libraries:
         patterns:
           - "coverage"
@@ -61,7 +69,6 @@ updates:
         patterns:
           - "django-stubs"
           - "djangorestframework-stubs"
-          - "types-pyOpenSSL"
           - "types-requests"
   - package-ecosystem: "github-actions"
     directory: "/"

@@ -49,7 +49,7 @@ and both have their dependencies checked by Dependabot.
 
 What follows is a list of dependencies and how to check for potential breakage when they release new versions:
 
-### `*lint*`, `@types/*`, `typescript`, `*jest*`, `@testing-library/*`, `react-test-renderer`, `fast-check`, `prettier`
+### `*lint*`, `@types/*`, `typescript`, `*jest*`, `@testing-library/*`, `react-test-renderer`, `prettier`
 
 For linters, type definitions, and non-Playwright testing-related packages, a
 successful CI run generally provides enough confidence that the upgrade is fine.
@@ -60,18 +60,34 @@ see code coverage for the frontend.
 
 ### `@playwright/test` and `dotenv`
 
-Our Playwright tests are currently only triggered in CI once a day from the
-`main` branch. Thus, there's unfortunately no easy way to verify that it still
-runs successfully until after merging. To do so, after merging the PR, open the
-"Actions" tab in GitHub, then find the "[Relay e2e
-Tests](https://github.com/mozilla/fx-private-relay/actions/workflows/playwright.yml)"
-workflow on the left-hand side, and then use the "Run workflow" trigger button
-in the top row of the table. Alternatively, you can also try run the end-to-end
-tests locally by following the instructions in
-[../e2e-tests/README.md](../e2e-tests/README.md#how-to-run).
+Our Playwright tests run as a GitHub action [Relay e2e Tests][] once a day from
+the `main` branch. See [../e2e-tests/README.md](../e2e-tests/README.md#how-to-run)
+for instructions on running the tests locally.
 
-`dotenv` is used to load environment variables for Playwright from `.env` files,
-so can be verified in the same way.
+To test updates to `@playwright/test` and `dotenv`, add the following to the
+`.env` file:
+
+```
+E2E_TEST_ACCOUNT_PASSWORD=<a_long_random_string_like_a_uuid>
+E2E_TEST_ENV=stage
+```
+
+Check out the update branch and run:
+
+```
+npm install
+npx playwright install
+npx playwright test
+```
+
+This will confirm that `dotenv` picked up the settings from `.env`, and that
+the new playwright runs against stage.
+
+Once the PR is merged, you can wait for the daily test run, or manually run the
+test by going to the [Relay e2e Tests][] GitHub Action page, select "Run
+workflow", and pick the `main` branch and the `stage` environment.
+
+[Relay e2e Tests]: https://github.com/mozilla/fx-private-relay/actions/workflows/playwright.yml
 
 ### `react-aria` and `react-stately`
 
@@ -212,7 +228,7 @@ This is the interface library for Amazon Web Services (AWS). This library is
 generated from the API definition files, and has multiple patch updates most
 weeks. A successful CI test run means the upgrade is OK.
 
-See the upgrade notes for a taste of the changes AWS developers are making to
+See the changelog notes for a taste of the changes AWS developers are making to
 the services we use. We use clients for the following services in code:
 
 - S3 - Simple Storage Service
@@ -226,6 +242,13 @@ We use these additional AWS services in the Relay system:
 - KMS - Key Management Service
 - Route53 - Domain Name Service
 - SNS - Simple Notification Service
+
+It's a good idea to search the changelog for any changes to these services between the
+current library version that Relay uses and the version in the dependency update PR.
+
+Because the boto3 library and release notes are so large, you may have trouble reading
+them in the GitHub website UI. If so, you can view the raw changelog here:
+https://raw.githubusercontent.com/boto/boto3/develop/CHANGELOG.rst
 
 ### django
 

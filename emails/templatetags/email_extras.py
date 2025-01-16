@@ -1,7 +1,7 @@
 from django import template
 from django.template.defaultfilters import stringfilter
 from django.utils.html import conditional_escape
-from django.utils.safestring import mark_safe, SafeString
+from django.utils.safestring import SafeString, mark_safe
 
 register = template.Library()
 
@@ -25,7 +25,9 @@ def bold_violet_link(href, link_text):
 
 @register.filter(needs_autoescape=True)
 @stringfilter
-def convert_fsi_to_span(text: str | SafeString, autoescape=True) -> str | SafeString:
+def convert_fsi_to_span(
+    text: str | SafeString, autoescape: bool = True
+) -> str | SafeString:
     """
     Replace Fluent's unicode isolating characters with HTML markup.
 
@@ -50,4 +52,4 @@ def convert_fsi_to_span(text: str | SafeString, autoescape=True) -> str | SafeSt
         )
     else:
         result = f'{pre_fsi}<span dir="auto">{middle}</span>{post_pdi}'
-    return mark_safe(result)
+    return mark_safe(result)  # noqa: S308 (use of mark_safe)
