@@ -59,3 +59,4 @@ mypy-boto3-sns==1.39.0
 mypy-boto3-sqs==1.39.0
 mypy==1.17.0
 types-requests==2.32.4.20250611
+urllib3>=2.5.0 # not directly required, pinned by Snyk to avoid a vulnerability
