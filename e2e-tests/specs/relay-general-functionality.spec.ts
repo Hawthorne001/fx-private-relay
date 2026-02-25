@@ -1,9 +1,24 @@
 import test, { expect } from "../fixtures/basePages";
-import { checkAuthState, defaultScreenshotOpts } from "../e2eTestUtils/helpers";
+import {
+  checkAuthState,
+  defaultScreenshotOpts,
+  ENV_URLS,
+  fetchMaxNumFreeAliases,
+  MAX_NUM_FREE_ALIASES,
+} from "../e2eTestUtils/helpers";
 
 // using logged in state outside of describe block will cover state for all tests in file
 test.use({ storageState: "state.json" });
+
+let freeMaskLimit = MAX_NUM_FREE_ALIASES;
+
 test.describe("Free - General Functionalities, Desktop", () => {
+  test.beforeAll(async () => {
+    const env = process.env.E2E_TEST_ENV ?? "stage";
+    const baseUrl = ENV_URLS[env] as string;
+    freeMaskLimit = await fetchMaxNumFreeAliases(baseUrl);
+  });
+
   test.beforeEach(async ({ dashboardPage, page }) => {
     await dashboardPage.open();
     await checkAuthState(page);
@@ -11,16 +26,16 @@ test.describe("Free - General Functionalities, Desktop", () => {
     await dashboardPage.maybeDeleteMasks();
   });
 
-  test("Check the free user can only create 5 masks, C1553067", async ({
+  test(`Check the free user can only create ${MAX_NUM_FREE_ALIASES} masks, C1553067`, async ({
     dashboardPage,
   }) => {
-    // Generating five masks takes a while:
+    // Generating masks up to the free limit takes a while:
     await expect(async () => {
-      await dashboardPage.generateMask(5);
-      expect((await dashboardPage.maskCards.count()) === 5);
+      await dashboardPage.generateMask(freeMaskLimit);
+      expect((await dashboardPage.maskCards.count()) === freeMaskLimit);
     }).toPass();
 
-    // After five times, user cannot add other masks anymore
+    // After reaching the limit, user cannot add other masks anymore
     expect(await dashboardPage.maxMaskLimitButton.textContent()).toContain(
       "Get unlimited email masks",
     );

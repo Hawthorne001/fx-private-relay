@@ -27,6 +27,20 @@ export const TIMEOUTS = {
   LONG: 10000,
 };
 
+// Default free mask limit — matches INCREASED_MAX_NUM_FREE_ALIASES in settings.py.
+// Used in test names (must be static) and as a fallback if the API fetch fails.
+export const MAX_NUM_FREE_ALIASES = 50;
+
+// Fetches the live mask limit from the runtime data API for the current environment.
+export const fetchMaxNumFreeAliases = async (
+  baseUrl: string,
+): Promise<number> => {
+  const context = await request.newContext();
+  const res = await context.get(`${baseUrl}/api/v1/runtime_data/`);
+  const data = await res.json();
+  return data.MAX_NUM_FREE_ALIASES ?? MAX_NUM_FREE_ALIASES;
+};
+
 export const getVerificationCode = async (
   testEmail: string,
   page: Page,
