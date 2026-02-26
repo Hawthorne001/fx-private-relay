@@ -1364,7 +1364,7 @@ class ComplaintHandlingTest(TestCase):
         assert self.user.profile.auto_block_spam is True
         self.mock_ses_client.send_raw_email.assert_not_called()
 
-        (rec1, rec2) = logs.records
+        rec1, rec2 = logs.records
         assert rec1.msg == "_handle_complaint: developer_mode"
         assert getattr(rec1, "mask_id") == self.ra.metrics_id
         assert getattr(rec1, "dev_action") == "log"
@@ -1399,7 +1399,7 @@ class ComplaintHandlingTest(TestCase):
         assert getattr(info_log, "user_match") == "no_recipients"
         assert getattr(info_log, "relay_action") == "no_action"
 
-        (err_log1, err_log2) = error_logs.records
+        err_log1, err_log2 = error_logs.records
         assert err_log1.msg == "_gather_complainers: unknown complainedRecipient"
         assert err_log2.msg == "_gather_complainers: unknown mask, maybe deleted?"
 
@@ -1675,7 +1675,7 @@ class GatherComplainersTest(TestCase):
             complainers, unknown_count = _gather_complainers(data)
         assert complainers == []
         assert unknown_count == 2
-        (err_log1, err_log2) = error_logs.records
+        err_log1, err_log2 = error_logs.records
         assert err_log1.msg == "_gather_complainers: unknown complainedRecipient"
         assert err_log2.msg == "_gather_complainers: unknown mask, maybe deleted?"
 
@@ -1825,7 +1825,7 @@ class GatherComplainersTest(TestCase):
             }
         ]
         assert unknown_count == 1
-        (err_log1, err_log2) = error_logs.records
+        err_log1, err_log2 = error_logs.records
         assert err_log1.msg == "_gather_complainers: unknown complainedRecipient"
         assert err_log2.msg == "_gather_complainers: no complainer, multi-mask"
 
@@ -3059,7 +3059,7 @@ def test_build_reply_requires_premium_email_first_time_includes_forward_text():
     original_sender = "external_sender@test.com"
     original_msg_id = "<external-msg-id-123@test.com>"
     original_msg_id_bytes = get_message_id_bytes(original_msg_id)
-    (lookup_key, encryption_key) = derive_reply_keys(original_msg_id_bytes)
+    lookup_key, encryption_key = derive_reply_keys(original_msg_id_bytes)
     original_metadata = {
         "message-id": original_msg_id,
         "from": original_sender,
@@ -3111,7 +3111,7 @@ def test_build_reply_requires_premium_email_after_forward():
     original_sender = "external_sender@test.com"
     original_msg_id = "<external-msg-id-123@test.com>"
     original_msg_id_bytes = get_message_id_bytes(original_msg_id)
-    (lookup_key, encryption_key) = derive_reply_keys(original_msg_id_bytes)
+    lookup_key, encryption_key = derive_reply_keys(original_msg_id_bytes)
     original_metadata = {
         "message-id": original_msg_id,
         "from": original_sender,
@@ -3210,9 +3210,7 @@ def test_get_keys_from_headers_in_reply_to():
     msg_id_bytes = get_message_id_bytes(msg_id)
     lookup_key, encryption_key = derive_reply_keys(msg_id_bytes)
     headers = [{"name": "In-Reply-To", "value": msg_id}]
-    (lookup_key_from_header, encryption_key_from_header) = _get_keys_from_headers(
-        headers
-    )
+    lookup_key_from_header, encryption_key_from_header = _get_keys_from_headers(headers)
     assert lookup_key == lookup_key_from_header
     assert encryption_key == encryption_key_from_header
 
@@ -3228,9 +3226,7 @@ def test_get_keys_from_headers_references_reply():
     baker.make(Reply, lookup=b64_lookup_key(lookup_key))
     msg_ids = f"<msg-id-123@email.com> {msg_id} <msg-id-789@email.com>"
     headers = [{"name": "References", "value": msg_ids}]
-    (lookup_key_from_header, encryption_key_from_header) = _get_keys_from_headers(
-        headers
-    )
+    lookup_key_from_header, encryption_key_from_header = _get_keys_from_headers(headers)
     assert lookup_key == lookup_key_from_header
     assert encryption_key == encryption_key_from_header
 

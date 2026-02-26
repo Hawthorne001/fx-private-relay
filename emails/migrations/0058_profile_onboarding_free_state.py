@@ -22,8 +22,7 @@ def add_db_default_forward_func(apps, schema_editor):
             'UPDATE "emails_profile"' ' SET "onboarding_free_state" = 0;'
         )
     elif schema_editor.connection.vendor.startswith("sqlite"):
-        schema_editor.execute(
-            """
+        schema_editor.execute("""
             CREATE TABLE "new__emails_profile" (
                 "id" integer NOT NULL PRIMARY KEY AUTOINCREMENT, 
                 "onboarding_free_state" integer unsigned NOT NULL CHECK ("onboarding_free_state" >= 0) DEFAULT 0, 
@@ -65,10 +64,8 @@ def add_db_default_forward_func(apps, schema_editor):
                 "created_by" varchar(63) NULL, 
                 "sent_welcome_email" bool NOT NULL
             );
-        """
-        )
-        schema_editor.execute(
-            """
+        """)
+        schema_editor.execute("""
             INSERT INTO "new__emails_profile" (
                 "id", "api_token", "user_id", "address_last_deleted", 
                 "num_address_deleted", "last_hard_bounce", 
@@ -121,8 +118,7 @@ def add_db_default_forward_func(apps, schema_editor):
                 0 
             FROM 
                 "emails_profile";
-            """
-        )
+            """)
         schema_editor.execute('DROP TABLE "emails_profile";')
         schema_editor.execute(
             'ALTER TABLE "new__emails_profile" RENAME TO "emails_profile";'

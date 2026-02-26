@@ -12,14 +12,12 @@ def remove_incident_index(apps, schema_editor):
 def add_incident_index(apps, schema_editor):
     """Add the index manually added during the March 28, 2024 incident."""
     if schema_editor.connection.vendor.startswith("postgres"):
-        schema_editor.execute(
-            """
+        schema_editor.execute("""
             CREATE INDEX IF NOT EXISTS incident_glean_202403
             ON emails_relayaddress (user_id)
             INCLUDE (created_at)
             WHERE (generated_for != '');
-            """
-        )
+            """)
 
 
 class Migration(migrations.Migration):

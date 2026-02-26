@@ -18,8 +18,7 @@ def add_db_default_forward_func(apps, schema_editor):
             ' ALTER COLUMN "num_deleted_domain_addresses" SET DEFAULT 0;'
         )
     elif schema_editor.connection.vendor.startswith("sqlite"):
-        schema_editor.execute(
-            """
+        schema_editor.execute("""
             CREATE TABLE "new__emails_profile" (
                 "id" integer NOT NULL PRIMARY KEY AUTOINCREMENT, 
                 "num_deleted_relay_addresses" integer unsigned NOT NULL CHECK (
@@ -68,10 +67,8 @@ def add_db_default_forward_func(apps, schema_editor):
                 "onboarding_free_state" integer unsigned NOT NULL CHECK ("onboarding_free_state" >= 0),
                 "last_engagement" datetime NULL
             );
-            """
-        )
-        schema_editor.execute(
-            """
+            """)
+        schema_editor.execute("""
             INSERT INTO "new__emails_profile" (
                 "id", "api_token", "user_id", "address_last_deleted", 
                 "num_address_deleted", "last_hard_bounce", 
@@ -129,8 +126,7 @@ def add_db_default_forward_func(apps, schema_editor):
                 0
             FROM 
                 "emails_profile";
-            """
-        )
+            """)
         schema_editor.execute('DROP TABLE "emails_profile";')
         schema_editor.execute(
             'ALTER TABLE "new__emails_profile" RENAME TO "emails_profile";'
