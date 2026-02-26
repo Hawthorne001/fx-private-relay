@@ -36,7 +36,7 @@ export const WhatsNewList = (props: Props) => {
         /* istanbul ignore if [Types can't represent that a `selectedItem` should always be found, but it should.] */
         if (!selectedItem) {
           console.error(
-            `WhatsNewListMenu.onSelect: [${key}] not found in the contained Items.`,
+            `WhatsNewListMenu.onSelect: [${String(key)}] not found in the contained Items.`,
           );
           return;
         }
