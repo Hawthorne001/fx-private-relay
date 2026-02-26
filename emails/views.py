@@ -284,8 +284,7 @@ def wrapped_email_test(request: HttpRequest) -> HttpResponse:
         new_query[key] = value
         return f'<a href="{path}?{urlencode(new_query)}">{value}</a>'
 
-    html_content = dedent(
-        f"""\
+    html_content = dedent(f"""\
     <p>
       <strong>Email rendering Test</strong>
     </p>
@@ -330,8 +329,7 @@ def wrapped_email_test(request: HttpRequest) -> HttpResponse:
         {switch_link("num_level_one_email_trackers_removed", "2")})
       </li>
     </ul>
-    """
-    )
+    """)
 
     wrapped_email = wrap_html_email(
         original_html=html_content,
@@ -353,7 +351,7 @@ def _store_reply_record(
         if header["name"].lower() in ["message-id", "from", "reply-to"]:
             reply_metadata[header["name"].lower()] = header["value"]
     message_id_bytes = get_message_id_bytes(message_id)
-    (lookup_key, encryption_key) = derive_reply_keys(message_id_bytes)
+    lookup_key, encryption_key = derive_reply_keys(message_id_bytes)
     lookup = b64_lookup_key(lookup_key)
     encrypted_metadata = encrypt_reply_metadata(encryption_key, reply_metadata)
     reply_create_args: dict[str, Any] = {
@@ -686,7 +684,7 @@ def _handle_received(message_json: AWS_SNSMessageJSON) -> HttpResponse:
 
     # check if this is a reply from an external sender to a Relay user
     try:
-        (lookup_key, _) = _get_keys_from_headers(mail["headers"])
+        lookup_key, _ = _get_keys_from_headers(mail["headers"])
         reply_record = _get_reply_record_from_lookup_key(lookup_key)
         user_address = address
         address = reply_record.address
@@ -765,7 +763,7 @@ def _handle_received(message_json: AWS_SNSMessageJSON) -> HttpResponse:
 
     # Get incoming email
     try:
-        (incoming_email_bytes, transport, load_time_s) = _get_email_bytes(message_json)
+        incoming_email_bytes, transport, load_time_s = _get_email_bytes(message_json)
     except ClientError as e:
         if e.response["Error"].get("Code", "") == "NoSuchKey":
             logger.error("s3_object_does_not_exist", extra=e.response["Error"])
@@ -1400,7 +1398,7 @@ def _handle_reply(
     """
     mail = message_json["mail"]
     try:
-        (lookup_key, encryption_key) = _get_keys_from_headers(mail["headers"])
+        lookup_key, encryption_key = _get_keys_from_headers(mail["headers"])
     except ReplyHeadersNotFound:
         incr_if_enabled("reply_email_header_error", 1, tags=["detail:no-header"])
         return HttpResponse("No In-Reply-To header", status=400)
@@ -1434,7 +1432,7 @@ def _handle_reply(
     }
 
     try:
-        (email_bytes, transport, load_time_s) = _get_email_bytes(message_json)
+        email_bytes, transport, load_time_s = _get_email_bytes(message_json)
     except ClientError as e:
         if e.response["Error"].get("Code", "") == "NoSuchKey":
             logger.error("s3_object_does_not_exist", extra=e.response["Error"])

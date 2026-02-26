@@ -15,21 +15,16 @@ def add_db_default_forward_func(apps, schema_editor):
     `./manage.py sqlmigrate` did not work, so the sqlite3 steps are manual.
     """
     if schema_editor.connection.vendor.startswith("postgres"):
-        schema_editor.execute(
-            """
+        schema_editor.execute("""
             ALTER TABLE "socialaccount_socialapp"
                 ALTER COLUMN "provider_id" SET DEFAULT '';
-            """
-        )
-        schema_editor.execute(
-            """
+            """)
+        schema_editor.execute("""
             ALTER TABLE "socialaccount_socialapp"
                 ALTER COLUMN "settings" SET DEFAULT '{}';
-            """
-        )
+            """)
     elif schema_editor.connection.vendor.startswith("sqlite"):
-        schema_editor.execute(
-            """
+        schema_editor.execute("""
             CREATE TABLE "new__socialaccount_socialapp" (
                 "id" integer NOT NULL PRIMARY KEY AUTOINCREMENT,
                 "provider" varchar(30) NOT NULL,
@@ -42,10 +37,8 @@ def add_db_default_forward_func(apps, schema_editor):
                   DEFAULT '{}'
                   CHECK ((JSON_VALID("settings") OR "settings" IS NULL))
             );
-            """
-        )
-        schema_editor.execute(
-            """
+            """)
+        schema_editor.execute("""
             INSERT INTO "new__socialaccount_socialapp"
                 ("id", "provider", "name", "client_id", "secret", "key", "provider_id",
                  "settings")
@@ -53,15 +46,12 @@ def add_db_default_forward_func(apps, schema_editor):
                 "id", "provider", "name", "client_id", "secret", "key", "provider_id",
                 "settings"
               FROM "socialaccount_socialapp";
-            """
-        )
+            """)
         schema_editor.execute('DROP TABLE "socialaccount_socialapp";')
-        schema_editor.execute(
-            """
+        schema_editor.execute("""
             ALTER TABLE "new__socialaccount_socialapp"
               RENAME TO "socialaccount_socialapp";
-            """
-        )
+            """)
     else:
         raise Exception(f'Unknown database vendor "{schema_editor.connection.vendor}"')
 

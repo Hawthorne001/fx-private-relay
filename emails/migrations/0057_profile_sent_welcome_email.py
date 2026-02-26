@@ -22,8 +22,7 @@ def add_db_default_forward_func(apps, schema_editor):
             'UPDATE "emails_profile"' ' SET "sent_welcome_email" = true;'
         )
     elif schema_editor.connection.vendor.startswith("sqlite"):
-        schema_editor.execute(
-            """
+        schema_editor.execute("""
             CREATE TABLE "new__emails_profile" (
                 "id" integer NOT NULL PRIMARY KEY AUTOINCREMENT,
                 "api_token" char(32) NOT NULL,
@@ -54,8 +53,7 @@ def add_db_default_forward_func(apps, schema_editor):
                 "created_by" varchar(63) NULL,
                 "sent_welcome_email" bool NULL
             );
-        """
-        )
+        """)
         schema_editor.execute(
             'INSERT INTO "new__emails_profile"'
             ' ("id",'
