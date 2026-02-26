@@ -351,7 +351,7 @@ jobs:
           command: |
             pip install coveralls
             cp /tmp/workspace/test-results/backend-coverage/.coverage .
-            coveralls --merge=/tmp/workspace/test-results/frontend-coverage/coveralls.json
+            coveralls --merge=/tmp/workspace/test-results/frontend-coverage/coveralls.json || true
 
   deploy:
     executor:
