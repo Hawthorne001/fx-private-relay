@@ -14,6 +14,7 @@ from .views.emails import (
     DomainAddressViewSet,
     RelayAddressViewSet,
     first_forwarded_email,
+    sentry_test,
 )
 from .views.privaterelay import (
     FlagViewSet,
@@ -91,6 +92,11 @@ urlpatterns: list[URLPattern | URLResolver] = [
         "v1/first-forwarded-email/",
         first_forwarded_email,
         name="first_forwarded_email",
+    ),
+    path(
+        "v1/sentry-test/",
+        enable_if_setting("SENTRY_TEST_ENABLED")(sentry_test),
+        name="sentry_test",
     ),
 ]
 

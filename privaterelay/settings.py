@@ -18,7 +18,7 @@ import os
 import sys
 from hashlib import sha256
 from pathlib import Path
-from typing import TYPE_CHECKING, cast, get_args
+from typing import TYPE_CHECKING, Any, cast, get_args
 
 from django.conf.global_settings import LANGUAGES as DEFAULT_LANGUAGES
 
@@ -150,6 +150,7 @@ else:
     ]
 
 API_DOCS_ENABLED = config("API_DOCS_ENABLED", False, cast=bool) or DEBUG
+SENTRY_TEST_ENABLED = config("SENTRY_TEST_ENABLED", False, cast=bool)
 _CSP_SCRIPT_INLINE = USE_SILK
 
 # When running locally, styles might get refreshed while the server is running, so their
@@ -886,31 +887,30 @@ if SENTRY_ENVIRONMENT == "prod" and SITE_ORIGIN != "https://relay.firefox.com":
 
 def _sentry_before_send(event: Event, hint: Hint) -> Event | None:
     """
-    Reads pre-parsed platform from request object (set by middleware).
+    Tags Sentry events with relay client platform from the X-Relay-Client header.
 
     See https://docs.sentry.io/platforms/python/configuration/filtering/#using-before-send
     """
-    request = None
-    if hint and "request" in hint:
-        request = hint["request"]
+    from privaterelay.utils import parse_relay_client_platform
 
-    if request:
-        os_value = getattr(request, "relay_client_os", None)
-        platform_value = getattr(request, "relay_client_platform", None)
-        header_value = getattr(request, "relay_client_header", None)
+    request_data = cast(dict[str, Any], event.get("request", {}))
+    headers = cast(dict[str, Any], request_data.get("headers", {}))
+    relay_client_header = str(headers.get("X-Relay-Client", ""))
+
+    if relay_client_header:
+        os_value, platform_value = parse_relay_client_platform(relay_client_header)
 
         if os_value:
             if "tags" not in event:
                 event["tags"] = {}
             event["tags"]["relay_client_platform"] = os_value
 
-            # Also add to context for detailed analysis
             if "contexts" not in event:
                 event["contexts"] = {}
             event["contexts"]["relay_client"] = {
-                "header_value": header_value or "",
+                "header_value": relay_client_header,
                 "os": os_value,
-                "platform": platform_value or "",
+                "platform": platform_value,
             }
 
     return event
