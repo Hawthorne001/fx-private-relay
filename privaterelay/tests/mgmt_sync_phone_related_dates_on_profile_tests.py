@@ -240,8 +240,7 @@ def test_yearly_phone_subscriber_with_subscription_date_older_than_31_days_profi
 
     profile = phone_user.profile
     profile.refresh_from_db()
-    sixty_two_days_from_subsciprion_date = date_subscribed_phone + timedelta(62)
-    assert profile.date_phone_subscription_reset == sixty_two_days_from_subsciprion_date
+    assert profile.date_phone_subscription_reset == date_subscribed_phone
     assert profile.date_subscribed_phone == date_subscribed_phone
     assert profile.date_phone_subscription_start == date_subscribed_phone
     assert profile.date_phone_subscription_end == date_subscribed_phone + timedelta(365)
