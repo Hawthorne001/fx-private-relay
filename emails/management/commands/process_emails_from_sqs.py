@@ -495,4 +495,6 @@ def run_sns_inbound_logic(
         if not cursor.db.is_usable():
             cursor.db.close()
 
-    return cast(HttpResponse, _sns_inbound_logic(topic_arn, message_type, json_body))
+    result = cast(HttpResponse, _sns_inbound_logic(topic_arn, message_type, json_body))
+    connection.close()
+    return result
