@@ -251,3 +251,10 @@ def first_forwarded_email(request):
     )
     logger.info(f"Sent first_forwarded_email to user ID: {user.id}")
     return Response(status=HTTP_201_CREATED)
+
+
+@api_view(["GET"])
+@permission_classes([IsAuthenticated])
+def sentry_test(request):
+    """endpoint to verify _sentry_before_send."""
+    raise RuntimeError("sentry_before_send test")
