@@ -224,6 +224,39 @@ def test_phone_subscriber_with_phones_reset_31_day_ago_phone_limits_updated(
     assert relay_number.remaining_seconds == settings.MAX_MINUTES_PER_BILLING_CYCLE * 60
 
 
+def test_sync_advancing_reset_date_causes_update_to_incorrectly_skip_reset(
+    patch_datetime_now: datetime, phone_user: User
+) -> None:
+    # Reproduces the race condition between sync_phone_related_dates_on_profile
+    # and update_phone_remaining_stats.
+    #
+    # Scenario: stats were last reset 32 days ago (reset was due 1 day ago).
+    # sync_phone_related_dates_on_profile's while loop fires and advances
+    # date_phone_subscription_reset by 31 days — without touching remaining_texts
+    # or remaining_seconds. update then sees the advanced date, calculates the
+    # next reset as 30 days from now, and skips. The user's limits are never
+    # refreshed for the billing cycle.
+    expected_now = patch_datetime_now
+    relay_number = _make_used_relay_number(phone_user)
+
+    # Reset date is 32 days in the past — one day overdue.
+    # Before the fix, sync_phone_related_dates_on_profile would advance this by 31 days
+    # (to yesterday) without resetting stats, causing update to skip. After the fix,
+    # sync no longer touches date_phone_subscription_reset, so update sees the
+    # original 32-day-old date and correctly triggers a reset.
+    phone_user.profile.date_phone_subscription_reset = expected_now - timedelta(32)
+    phone_user.profile.save()
+
+    num_profiles_w_phones, num_profiles_updated = update_phone_remaining_stats()
+
+    phone_user.profile.refresh_from_db()
+    relay_number.refresh_from_db()
+    assert num_profiles_w_phones == 1
+    assert num_profiles_updated == 1
+    assert relay_number.remaining_texts == settings.MAX_TEXTS_PER_BILLING_CYCLE
+    assert relay_number.remaining_seconds == settings.MAX_MINUTES_PER_BILLING_CYCLE * 60
+
+
 def test_phone_subscriber_with_subscription_end_date_sooner_than_31_days_since_reset_phone_limits_updated(  # noqa: E501
     phone_user: User,
 ) -> None:

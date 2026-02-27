@@ -1,5 +1,5 @@
 import logging
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 
 from django.conf import settings
 from django.core.management.base import BaseCommand, CommandParser
@@ -56,11 +56,6 @@ def sync_phone_related_dates_on_profile(group: str) -> int:
             # initialize the reset date for phone subscription users to the start of the
             # subscription
             profile.date_phone_subscription_reset = start_date
-        thirtyone_days_ago = datetime_now - timedelta(settings.MAX_DAYS_IN_MONTH)
-        while profile.date_phone_subscription_reset < thirtyone_days_ago:
-            profile.date_phone_subscription_reset += timedelta(
-                settings.MAX_DAYS_IN_MONTH
-            )
         profile.save()
         num_updated_accounts += 1
     return num_updated_accounts
