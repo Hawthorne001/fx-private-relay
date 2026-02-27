@@ -571,6 +571,24 @@ def test_writes_healthcheck_file(test_settings: SettingsWrapper) -> None:
     assert 0.0 < duration < 0.5
 
 
+def test_connection_closed_after_message_processed(
+    mock_sqs_client: Mock,
+) -> None:
+    """DB connection is closed cleanly after each message.
+
+    Without this, the subprocess exits with an open connection and PostgreSQL
+    logs 'could not receive data from client: Connection reset by peer' for
+    every message processed.
+
+    https://mozilla-hub.atlassian.net/browse/MPP-4599
+    """
+    msg = fake_sqs_message(json.dumps(TEST_SNS_MESSAGE))
+    mock_sqs_client.return_value = fake_queue([msg], [])
+    with patch(f"{MOCK_BASE}.connection.close") as mock_close:
+        call_command(COMMAND_NAME)
+    mock_close.assert_called_once()
+
+
 def test_command_sqs_client_error(
     mock_sqs_client: Mock, test_settings: SettingsWrapper
 ) -> None:
