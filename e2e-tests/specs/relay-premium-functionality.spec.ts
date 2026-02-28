@@ -1,6 +1,19 @@
 import test, { expect } from "../fixtures/basePages";
+import {
+  ENV_URLS,
+  fetchMaxNumFreeAliases,
+  MAX_NUM_FREE_ALIASES,
+} from "../e2eTestUtils/helpers";
+
+let freeMaskLimit = MAX_NUM_FREE_ALIASES;
 
 test.describe("Premium - General Functionalities, Desktop", () => {
+  test.beforeAll(async () => {
+    const env = process.env.E2E_TEST_ENV ?? "stage";
+    const baseUrl = ENV_URLS[env] as string;
+    freeMaskLimit = await fetchMaxNumFreeAliases(baseUrl);
+  });
+
   test.beforeEach(async ({ landingPage, authPage, dashboardPage }) => {
     await landingPage.open();
     await landingPage.goToSignIn();
@@ -9,11 +22,11 @@ test.describe("Premium - General Functionalities, Desktop", () => {
     await dashboardPage.maybeDeleteMasks(true, parseInt(totalMasks as string));
   });
 
-  test("Verify that a premium user can make more than 5 masks", async ({
+  test(`Verify that a premium user can make more than ${MAX_NUM_FREE_ALIASES} masks`, async ({
     dashboardPage,
   }) => {
     expect(await dashboardPage.emailMasksUsedAmount.textContent()).toBe("0");
-    await dashboardPage.generateMask(6, true);
+    await dashboardPage.generateMask(freeMaskLimit + 1, true);
 
     await expect
       .poll(
@@ -24,7 +37,7 @@ test.describe("Premium - General Functionalities, Desktop", () => {
           intervals: [1_000],
         },
       )
-      .toContain("6");
+      .toContain(String(freeMaskLimit + 1));
   });
 
   test("Verify that a user can click the mask blocking options", async ({
