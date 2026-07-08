@@ -205,8 +205,7 @@ type BasketRequestBody = {
   source_url?: string;
 };
 type BasketResponseBody =
-  | { status: "ok" }
-  | { status: "error"; code: number; desc: string };
+  { status: "ok" } | { status: "error"; code: number; desc: string };
 /**
  * Subscribe someone to a newsletter using the newsletter API.
  *
