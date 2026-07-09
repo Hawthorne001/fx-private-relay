@@ -37,6 +37,12 @@ export const authenticatedFetch = async (
     headers.set("X-CSRFToken", csrfToken);
   }
   const options: Parameters<typeof fetch>[1] = {
+    // Bypass the browser HTTP cache. The API sends Cache-Control: max-age=60 on
+    // list endpoints to protect the origin from the autofill client, but that
+    // stops SWR from revalidating after a mutation, leaving the dashboard stale
+    // (MPP-4717). no-store keeps SWR reads fresh; the origin is still capped by
+    // the per-user throttle.
+    cache: "no-store",
     ...init,
     headers: headers,
     credentials: "include",

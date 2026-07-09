@@ -36,6 +36,23 @@ describe("useApiV1", () => {
     });
   });
 
+  it("fetches with cache: no-store so mutate() bypasses the browser cache (MPP-4717)", async () => {
+    const mockResponse = {
+      ok: true,
+      status: 200,
+      json: async () => ({}),
+    } as Response;
+    (global.fetch as jest.Mock).mockResolvedValue(mockResponse);
+    renderHook(() => useApiV1("/realphone", { dedupingInterval: 0 }));
+
+    await waitFor(() => {
+      expect(global.fetch).toHaveBeenCalledWith(
+        expect.any(String),
+        expect.objectContaining({ cache: "no-store" }),
+      );
+    });
+  });
+
   it("shows a toast when we 500", async () => {
     const mockRuntimeConfig = mockConfigModule.getRuntimeConfig();
     mockConfigModule.getRuntimeConfig.mockReturnValueOnce({
