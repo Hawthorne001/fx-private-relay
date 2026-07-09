@@ -60,7 +60,9 @@ def profile_refresh(request):
     profile = request.user.profile
 
     fxa = _get_fxa(request)
-    update_fxa(fxa)
+    response = update_fxa(fxa)
+    if response.status_code == 401:
+        return redirect(reverse("fxa_login"))
     if "clicked-purchase" in request.COOKIES and profile.has_premium:
         event = "user_purchased_premium"
         incr_if_enabled(event, 1)
@@ -304,8 +306,12 @@ def update_fxa_inner(
     try:
         resp = client.get(FirefoxAccountsOAuth2Adapter.profile_url)
     except CustomOAuth2Error as e:
+        # The stored OAuth token has scopes FxA no longer accepts, so the token
+        # refresh fails. Return 401 so the browser-facing profile_refresh can
+        # send the user to re-authenticate. The fxa_rp_events webhook ignores
+        # this return value, so its behavior is unchanged.
         sentry_sdk.capture_exception(e)
-        return HttpResponse("202 Accepted", status=202)
+        return HttpResponse("Authentication with Mozilla Accounts failed", status=401)
 
     sentry_context["profile_status_code"] = resp.status_code
     try:

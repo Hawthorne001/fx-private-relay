@@ -1,4 +1,5 @@
 import useSWR, { SWRConfig, SWRResponse } from "swr";
+import { getRuntimeConfig } from "../../config";
 import { DateString } from "../../functions/parseDate";
 import { apiFetch, authenticatedFetch, FetchError } from "./api";
 
@@ -110,7 +111,7 @@ export function useProfiles(): SWRResponse<ProfilesData, unknown> & {
  * The reason that it's needed is that we have to tell the back-end to re-fetch data from
  * Mozilla Accounts if the user was sent back here after trying to subscribe to Premium.
  */
-const profileFetcher = async (
+export const profileFetcher = async (
   url: string,
   requestInit: RequestInit,
 ): Promise<ProfilesData> => {
@@ -121,6 +122,12 @@ const profileFetcher = async (
     const refreshResponse = await authenticatedFetch(
       "/accounts/profile/refresh",
     );
+    // A 401 or a redirect means the stored Mozilla Accounts token is no longer
+    // valid. Send the user to re-authenticate instead of leaving stale data.
+    if (refreshResponse.status === 401 || refreshResponse.redirected) {
+      document.location.assign(getRuntimeConfig().fxaLoginUrl);
+      return new Promise<ProfilesData>(() => {});
+    }
     await refreshResponse.json();
   }
 
