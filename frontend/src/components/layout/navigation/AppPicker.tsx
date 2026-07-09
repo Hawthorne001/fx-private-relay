@@ -16,7 +16,7 @@ import {
   useFocus,
 } from "react-aria";
 import { Key, ReactNode, useRef, useState, useEffect } from "react";
-import type { AriaMenuItemProps, AriaMenuOptions } from "react-aria";
+import type { AriaMenuItemProps } from "react-aria";
 import styles from "./AppPicker.module.scss";
 import FirefoxLogo from "../images/fx.png";
 import MonitorLogo from "../images/monitor.png";
@@ -206,7 +206,7 @@ type AppPickerTriggerProps = Parameters<typeof useMenuTriggerState>[0] & {
   label: string;
   style: string;
   children: TreeProps<Record<string, never>>["children"];
-  onAction: AriaMenuOptions<Record<string, never>>["onAction"];
+  onAction: AriaMenuItemProps["onAction"];
   theme?: LayoutProps["theme"];
 };
 const AppPickerTrigger = ({
