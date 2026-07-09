@@ -228,8 +228,11 @@ def first_forwarded_email(request):
     mask = str(serializer.data.get("mask"))
     user = request.user
     try:
-        address = _get_address(mask)
-        RelayAddress.objects.get(user=user, address=address)
+        # create=False so an unowned mask cannot be side-effect created on
+        # another user's account before the ownership check below (MPP-4689).
+        address = _get_address(mask, create=False)
+        if not isinstance(address, RelayAddress) or address.user_id != user.id:
+            raise RelayAddress.DoesNotExist()
     except ObjectDoesNotExist:
         return Response(f"{mask} does not exist for user.", status=HTTP_404_NOT_FOUND)
     profile = user.profile
