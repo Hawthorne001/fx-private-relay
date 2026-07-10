@@ -16,6 +16,7 @@ from rest_framework.test import APIClient
 from waffle.testutils import override_flag
 
 from emails.models import DomainAddress, RelayAddress
+from emails.utils import get_domains_from_settings
 from privaterelay.tests.utils import (
     create_expected_glean_event,
     get_glean_event,
@@ -953,3 +954,18 @@ def test_first_forwarded_email_success(
     assert response.status_code == 201
     assert response.content == b""
     mock_ses_client.send_email.assert_called_once()
+
+
+def test_first_forwarded_email_other_users_subdomain_no_create(
+    free_api_client: APIClient,
+    premium_user: User,
+) -> None:
+    """A mask on another user's subdomain returns 404 without creating it (MPP-4689)."""
+    mozmail_domain = get_domains_from_settings()["MOZMAIL_DOMAIN"]
+    mask = f"attacker-label@{premium_user.profile.subdomain}.{mozmail_domain}"
+    with override_flag("free_user_onboarding", True):
+        response = free_api_client.post(
+            "/api/v1/first-forwarded-email/", {"mask": mask}
+        )
+    assert response.status_code == 404
+    assert not DomainAddress.objects.filter(user=premium_user).exists()
