@@ -10,7 +10,9 @@ from unittest.mock import Mock, patch
 from uuid import uuid4
 
 from django.contrib.auth.models import User
+from django.http import HttpResponse
 from django.test import Client, TestCase, override_settings
+from django.urls import reverse
 from django.utils import timezone
 
 import jwt
@@ -24,6 +26,7 @@ from cryptography.hazmat.primitives.asymmetric.rsa import (
 )
 from markus.testing import MetricsMock
 from model_bakery import baker
+from oauthlib.oauth2.rfc6749.errors import CustomOAuth2Error
 from pytest_django.fixtures import SettingsWrapper
 from requests import PreparedRequest
 
@@ -38,7 +41,7 @@ from privaterelay.tests.utils import premium_subscription
 from ..apps import PrivateRelayConfig
 from ..fxa_utils import NoSocialToken
 from ..models import Profile
-from ..views import _update_all_data, fxa_verifying_keys
+from ..views import _update_all_data, fxa_verifying_keys, update_fxa
 
 
 def test_no_social_token():
@@ -163,6 +166,41 @@ class UpdateExtraDataAndEmailTest(TestCase):
 
         ea = sa.user.emailaddress_set.get()
         assert ea.email == new_email
+
+
+@pytest.mark.django_db
+def test_update_fxa_returns_401_on_oauth_error() -> None:
+    """A stale-scope token failure returns 401 and is still reported to Sentry."""
+    user = baker.make(User)
+    sa: SocialAccount = baker.make(SocialAccount, user=user, provider="fxa")
+    mock_client = Mock()
+    mock_client.get.side_effect = CustomOAuth2Error("Invalid scopes")
+
+    with (
+        patch("privaterelay.views._get_oauth2_session", return_value=mock_client),
+        patch("privaterelay.views.sentry_sdk.capture_exception") as mock_capture,
+    ):
+        response = update_fxa(sa)
+
+    assert response.status_code == 401
+    mock_capture.assert_called_once()
+
+
+@pytest.mark.django_db
+def test_profile_refresh_redirects_to_login_on_oauth_error(client: Client) -> None:
+    """profile_refresh sends the user to re-authenticate when the token fails."""
+    user = baker.make(User)
+    baker.make(SocialAccount, user=user, provider="fxa")
+    client.force_login(user)
+
+    with patch(
+        "privaterelay.views.update_fxa",
+        return_value=HttpResponse(status=401),
+    ):
+        response = client.get("/accounts/profile/refresh")
+
+    assert response.status_code == 302
+    assert response.headers["Location"] == reverse("fxa_login")
 
 
 @pytest.mark.django_db

@@ -1,5 +1,5 @@
 import { renderHook, waitFor } from "@testing-library/react";
-import { useProfiles } from "./profile";
+import { profileFetcher, useProfiles } from "./profile";
 
 jest.mock("./api", () => {
   const actual = jest.requireActual("./api");
@@ -171,5 +171,56 @@ describe("useProfiles", () => {
       await result.current.setSubdomain("another-subdomain");
     expect(subdomainResponse).toBe(mockSubdomainResponse);
     expect(mockMutate).toHaveBeenCalled();
+  });
+});
+
+describe("profileFetcher", () => {
+  const mockApiFetch = jest.fn();
+  const mockAuthenticatedFetch = jest.fn();
+
+  beforeEach(() => {
+    jest.clearAllMocks();
+    const api = jest.requireMock("./api");
+    api.apiFetch = mockApiFetch;
+    api.authenticatedFetch = mockAuthenticatedFetch;
+    // Set location.search without redefining the locked-down location object.
+    window.history.replaceState({}, "", "/?fxa_refresh=1");
+  });
+
+  it("re-authenticates and stops fetching when a refresh returns 401", async () => {
+    // jsdom cannot actually navigate, and logs an error when the fetcher calls
+    // document.location.assign. Silence that expected noise.
+    const errorSpy = jest.spyOn(console, "error").mockImplementation(() => {});
+    mockAuthenticatedFetch.mockResolvedValue({
+      status: 401,
+      redirected: false,
+    });
+
+    // The fetcher never resolves once it triggers a redirect, so don't await it.
+    profileFetcher("/profiles/", {});
+
+    await waitFor(() => {
+      expect(mockAuthenticatedFetch).toHaveBeenCalledWith(
+        "/accounts/profile/refresh",
+      );
+    });
+    // It must not fall through to fetch and return stale profile data.
+    expect(mockApiFetch).not.toHaveBeenCalled();
+    errorSpy.mockRestore();
+  });
+
+  it("fetches profile data after a successful refresh", async () => {
+    mockAuthenticatedFetch.mockResolvedValue({
+      status: 200,
+      redirected: false,
+      json: async () => ({}),
+    });
+    const profile = createMockProfile();
+    mockApiFetch.mockResolvedValue({ ok: true, json: async () => [profile] });
+
+    const data = await profileFetcher("/profiles/", {});
+
+    expect(data).toEqual([profile]);
+    expect(mockApiFetch).toHaveBeenCalledWith("/profiles/", {});
   });
 });
