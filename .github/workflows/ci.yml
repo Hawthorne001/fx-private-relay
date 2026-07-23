@@ -23,10 +23,10 @@ jobs:
           submodules: recursive
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v4.1.0
+        uses: docker/setup-buildx-action@v4.2.0
 
       - name: Build frontend Docker image
-        uses: docker/build-push-action@v7.2.0
+        uses: docker/build-push-action@v7.3.0
         with:
           context: .
           push: false
@@ -37,7 +37,7 @@ jobs:
           cache-to: type=gha,mode=max,scope=frontend
 
       - name: Build backend Docker image
-        uses: docker/build-push-action@v7.2.0
+        uses: docker/build-push-action@v7.3.0
         with:
           context: .
           push: false
@@ -269,7 +269,7 @@ jobs:
           python-version: '3.11.8'
 
       - name: Setup Ruby
-        uses: ruby/setup-ruby@v1.315.0
+        uses: ruby/setup-ruby@v1.318.0
         with:
           ruby-version: '3.2.3'
 
